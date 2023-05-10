@@ -1,0 +1,250 @@
+---
+title: "Functional groupings"
+author: "JayToh"
+date: '2023-04-21'
+output: html_document
+---
+
+# Library:
+```{r, Warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor) # table when group_by cannot count
+library(ggpubr)
+
+library(tidyr)
+
+select <- dplyr::select
+
+```
+
+# Data:
+1. Filter out data that cannot be identified to the spp level
+
+```{r}
+Animals <- read.csv("1_Animal classification/Animal.csv") %>% filter(!(Class == "Not assigned")) %>% filter(!(Class == "")) %>% 
+  filter(!(Order == "Not assigned")) %>% filter(!(Order == "")) %>% 
+  filter(!(Family == "Not assigned")) %>% filter(!(Family == "")) 
+rm(Animals)
+
+load("../2. Grouping/1_Animal classification/SitesTrophicLevels.Rd")
+
+load("1_Animal classification/Animal.csv")
+
+Plants <- read.csv("2_Plant classification/Plant.csv") %>% filter(!(Class == "Not assigned")) %>% filter(!(Class == "")) %>% 
+  filter(!(Order == "Not assigned")) %>% filter(!(Order == "")) %>% 
+  filter(!(Family == "Not assigned")) %>% filter(!(Family == "")) 
+
+Fungi <- read.csv("3_Fungi classification/Fungi.csv") %>% filter(!(Class == "Not assigned")) %>% filter(!(Class == "")) %>% 
+  filter(!(Order == "Not assigned")) %>% filter(!(Order == "")) %>% 
+  filter(!(Family == "Not assigned")) %>% filter(!(Family == "")) 
+
+```
+
+# Plant:
+## CSR grouping
+1. Force classification into four: C, S, R, CSR. The others (e.g. C/SR, SR/CSR) were grouped into one of the four categorises based on the initial letter, representing the the most abundant group (e.g. into C, S)
+
+2. Matching GloNAF with our species
+
+4. For those that cannot be identified to species, they are matched to genus. For those without an identified genus, then they are matched to the family level. Priority follows spp > genus > family level.
+
+5. Species within genus or family may differ in their strategy. So I refer to Newbold et al.'s (2020) classification procedure, where a genus or family has a specific strategy only when 95% of the records have the same strategy. 
+This threshold  discarded 73.23% of data in C-strategy, 88.38% in S-strategy, and 91.4% in R-strategy. When lowering the threshold to 75%, the data lost were 64.6%, 84.34%, and 91.4% for CSR respectfully. (Equ = 100 - nrow(FamilyCSR %>% filter(RPercent >=75)) / nrow(FamilyCSR) * 100)
+
+6. Filter out records with undecided land use and intensity. Do this step last so that land use and intensity do not affect groupings of plant functional groups. There were 1351100 records before filtering and 1177704 after. 
+
+7. Export data
+
+```{r, fig.height=10, fig.width=10}
+
+##############################################################################################################################
+######################################## Data from GloNAF database (Guo et al., 2018) ########################################
+##############################################################################################################################
+# Shifting + Renaming to fit PREDICTS
+Plant_FG <- read.csv("2_Plant classification/CSR_only.csv") %>% 
+  relocate(order) %>% relocate(family, .after = order) %>% 
+  relocate(genus, .after = family) %>% 
+  relocate(species_1, .after = genus) %>% 
+  relocate(species, .after = species_1) %>% 
+  rename("Binomial" = "species") %>% 
+  rename("Species" = "species_1") %>% 
+  rename("Order" = "order") %>% 
+  rename("Family" = "family") %>% 
+  rename("Genus" = "genus") %>% 
+  mutate(CSR_simplified = CSR)
+
+dplyr::count(Plants, Species)
+
+
+# Forcing CSR strategy into one type
+Plant_FG$CSR_simplified <- dplyr::recode(Plant_FG$CSR,
+                                          "C/CR" = "C",
+                                          "C/CS" = "C",
+                                          "C/CSR" = "C",
+                                          "CR" = "CSR",
+                                          "CR/CSR" = "CSR",
+                                          "CS" = "CSR",
+                                          "CS/CSR" = "CSR", 
+                                          "R/CR" = "R",
+                                          "R/CSR" = "R",
+                                          "R/SR" = "R",
+                                          "S/CS" = "S",
+                                          "S/CSR" = "S",
+                                          "S/SR" = "S",
+                                          "SR" = "CSR",
+                                          "SR/CSR" = "CSR")
+CSR <- Plant_FG %>% dplyr::select(-Binomial)
+
+# If the strategy contains two letters (e.g. CR, CS), then they count as CSR.
+
+
+# The CSR strategies of the plants in each family is counted and converted to percentages. For instance, the plant family Acanthaceae has 5 records in the PREDICTS database, where 4 utilise C-strategy and 1 S-strategy. Hence, 80% of Acanthaceae belongs to C-strategy and 20% S-strategy. Following the strict 95% classification by Newbold et al.'s (2020),  Acanthaceae will be classified as utilizing the CSR-strategy. 
+
+########################### Genus level summary ###########################
+# Count the number of species utilizing the C, S, R, or CSR strategy in each genus. 
+# Calculate percentages by: Number of species under a specified genus with that strategy / Sum of all the species under the specified genus
+GenusCSR <- tabyl(CSR, Genus, CSR_simplified) %>% mutate(CPercent = (C) *100 /(C+S+R+CSR),
+                                                           SPercent = (S) *100 /(C+S+R+CSR),
+                                                           RPercent = (R) *100 /(C+S+R+CSR),
+                                                           CSRPercent = (CSR) *100 /(C+S+R+CSR)) %>% 
+  mutate(CSR_Genus= ifelse(CPercent >=95, "C", ifelse(SPercent >= 95, "S", ifelse(RPercent > 95, "R", "CSR")))) 
+
+########################### Family level summary ###########################
+FamilyCSR <- tabyl(CSR, Family, CSR_simplified) %>% mutate(CPercent = (C) *100 /(C+S+R+CSR),
+                                                           SPercent = (S) *100 /(C+S+R+CSR),
+                                                           RPercent = (R) *100 /(C+S+R+CSR),
+                                                           CSRPercent = (CSR) *100 /(C+S+R+CSR)) %>% 
+  mutate(CSR_family = ifelse(CPercent >=95, "C", ifelse(SPercent >= 95, "S", ifelse(RPercent > 95, "R", "CSR")))) 
+
+
+##############################################################################################################################
+######################################## Merging GloNAF with PREDICTS data ###################################################
+##############################################################################################################################
+# 1. CSR data is first merged corresponding to the spp in PREDICTS
+# 2. For PREDICTS data that cannot be identified to the spp, the records are matched to the genus level strategy above
+# 3. The spp classification coalesce with the genus, but keep the original spp-level classification. Put it simply, the genus-classification only 'patches' empty rows. 
+# 4. For PREDICTS data that cannot be identified to the spp, the records are matched to the family level strategy above
+# 5. The genus classification coalesce with the family, but keep the original spp-level classification. Put it simply, the family-classification only 'patches' empty rows. 
+
+Plant_FGSorted <- dplyr::left_join(Plants, CSR, by = c("Order", "Family", "Genus", "Species")) # Merges data that can be identified to the spp level
+Plant_FGSorted <- dplyr::left_join(Plant_FGSorted, GenusCSR %>% dplyr::select(Genus ,CSR_Genus), by = "Genus") # Assign genus-level CSR to all records in a new column, CSR_genus
+Plant_FGSorted <- Plant_FGSorted %>% mutate(CSR_Genus_patched = coalesce(CSR_simplified, CSR_Genus)) # Create a new column, CSR_Genus_patched, and 'Patches' data that cannot be identified to the spp level
+
+
+Plant_FGSorted <- dplyr::left_join(Plant_FGSorted, FamilyCSR %>% dplyr::select(Family,CSR_family), by = "Family") # Assigns family-level CSR to all records in a new column, CSR_family
+Plant_FGSorted <- Plant_FGSorted %>% mutate(CSR_Final = coalesce(CSR_Genus_patched, CSR_family)) # Create a new column, CSR_Final, and 'Patches' data that cannot be identified to the spp level
+
+
+########################### Remove data with undecided land use and intensity ###########################
+Plant_FGFinal <- Plant_FGSorted %>% filter(!(Predominant_land_use == "Cannot decide")) %>% filter(!(Use_intensity == "Cannot decide"))
+write.csv(Plant_FGFinal, "PlantFG.csv")
+
+write.csv(Plant_FGSorted, "PlantFG.csv")
+```
+
+## Plant plots between CSR_family vs CSR_Final
+```{r, fig.height=10, fig.width=10}
+################################################################################## Plant_FGSorted is the FINAL dataset with the CSR sorted!!!!!
+
+count(Plant_FGSorted, CSR_Final)
+
+## 95% Threshold ##
+ggarrange(ggplot() + geom_histogram(data = FamilyCSR, aes(x = CPercent)) + geom_vline(xintercept = 95) + geom_vline(xintercept = 80, col = "red") + theme_classic() + labs(x = "Percentage (%)", y = "Frequency of Family", title = "Percentage of species in C-strategy (Family level)"),
+          ggplot() + geom_histogram(data = FamilyCSR, aes(x = SPercent)) + geom_vline(xintercept = 95) + geom_vline(xintercept = 80, col = "red") + theme_classic() + labs(x = "Percentage (%)", y = "Frequency of Family", title = "Percentage of species in S-strategy (Family level)"),
+          ggplot() + geom_histogram(data = FamilyCSR, aes(x = RPercent)) + geom_vline(xintercept = 95) + geom_vline(xintercept = 80, col = "red") + theme_classic() + labs(x = "Percentage (%)", y = "Frequency of Family", title = "Percentage of species in R-strategy (Family level)"))
+
+
+## CSR_simplified vs CSR_Family -----> NOT too different, CSR_Final has more spp at the S and R categories, less grouped to CSR
+
+ggarrange(
+  ggplot(data = Plant_FGSorted) + geom_bar(aes(x = CSR_family, fill = "Family"), alpha = 0.2) + 
+  geom_bar(aes(x = CSR_Final,  fill = "Simp"), alpha = 0.5) + scale_fill_manual(name = "CSR method", values = c("Family" = "Red" , "Simp" ="Blue")) + theme_classic(), 
+  ggplot() + theme_void(),
+  ggplot(data = Plant_FGSorted) + 
+  geom_bar(aes(x = CSR_family), fill = "red" ,alpha = 0.2),
+  ggplot(data = Plant_FGSorted) + geom_bar(aes(x = CSR_Final), fill = "blue", alpha = 0.5))
+
+```
+
+
+# Fungi:
+1. FunGuild database does not have the full taxonomic classification of each species under different columns. Instead, the fungi are identified based on the selected rank. Fungi at the species level have their binomial names given, hence it was used to estimate fungal functional groups (FG) at the genus level (henceforth, Genus-estimated FG).  Only records with a confidence ranking of probably or hihgly probable are taken, as advised by Nguyen et al. (2016). 
+
+2. Match functional groups to records that can be identified to the spp level.
+
+3. Match the FG to records that can only be identifed to the genus level
+
+4. An additional column for Genus-estimated FG is created where records are matched based on the the proportional of spp in a functional group. Genera where more than 95% of spp utilize the same functional group will be that functional group. If else, they would be grouped as generalist. Step 3 and 4 are taken to prevent situations where FunGuild has identified fungal FG to the genus level, but it does not have records at the species level. Reversely, FunGuild could also identify FG to the species level, but did not give a genus level record.
+
+For instance, the fungal genus, Stigmidium, is a pathotroph and all 81 of its species are all pathotrophs. This is an ideal genus as its genus FG matches its species FG. 
+
+However, there are records where the genus level FG is not given. For instance, Acremonium species show a mixture of pathotroph and symbiotroph lifestyle and there were no FG assigned to Acremonium at the genus level by FunGuild. In such case, I calculated the Genus-estimated FG and assigned it to the genus. In this case, Acremonium would be a generalist because none of the FG exceed the 95% threshold.  
+
+Yet, there were records where FunGuild assigned a FG to a fungal genus, but there were no species associated to it. For instance,	the fungal genus Zygospermella was a symbiotroph, but there were no species reported. Hence, if I use only the Genus-estimated FG, then FG-assigned genus records without any species would be lost. Hence, an extra column is made for this and is taken as a priority when patching data. 
+
+
+5. For those that cannot be identified to the genus level, they are matched to the family level FG. A Family-estimated cannot be calculated because the records were not fully taxonomically classified. Additional dataset will be required. Hence, I assume that the family FG given by FungGuild is complete. 
+
+6. The priority of FG_Final follows: FG_spp > FG_genus_given > FG_genus > FG_Family
+
+7. Filter out records without land use and intensity. There were 92595 records before filtering and 86798 after.
+```{r}
+# Actual
+########################### Genus level summary ###########################
+# Count the number of species utilizing the C, S, R, or CSR strategy in each genus. 
+# Calculate percentages by: Number of species under a specified genus with that strategy / Sum of all the species under the specified genus
+Fungi_FG_spp <- read.csv("3_Fungi classification/Fungi_FG.csv") %>% mutate(Binomial = Taxon) %>% filter(Rank == "Species") %>% tidyr::separate("Taxon", into = c("Genus", "Species")) %>% relocate(Binomial, .before = Genus) %>% filter(Confidence.Ranking == "Probable" | Confidence.Ranking == "Highly Probable") %>% select(Genus, Species, Trophic.Mode) %>% rename("FG_spp" = "Trophic.Mode")
+
+Fungi_FG_genus <- read.csv("3_Fungi classification/Fungi_FG.csv") %>% mutate(Binomial = Taxon) %>% filter(Rank == "Species" | Rank == "Genus") %>% tidyr::separate("Taxon", into = c("Genus", "Species")) %>% relocate(Binomial, .before = Genus) %>% filter(Confidence.Ranking == "Probable" | Confidence.Ranking == "Highly Probable") %>% select(Genus, Species, Trophic.Mode)
+
+FungiSpp <- tabyl(Fungi_FG_spp, Genus, Trophic.Mode) %>% mutate(PathotrophPer = (Pathotroph) *100 /(Pathotroph+Symbiotroph+Saprotroph),
+                                                            SaprotrophPer = (Saprotroph) *100 /(Pathotroph+Symbiotroph+Saprotroph),
+                                                           SymbiotrophPer = (Symbiotroph) *100 /(Pathotroph+Symbiotroph+Saprotroph)) %>% 
+  mutate(FG_genus = ifelse(PathotrophPer >=95, "Pathotroph", ifelse(SymbiotrophPer >= 95, "Symbiotroph", ifelse(SaprotrophPer > 95, "Saprotroph", "Generalist")))) 
+
+FungiGenus <- read.csv("3_Fungi classification/Fungi_FG.csv") %>% mutate(Binomial = Taxon) %>% filter(Rank == "Genus") %>% tidyr::separate("Taxon", into = c("Genus", "Species")) %>% relocate(Binomial, .before = Genus) %>% filter(Confidence.Ranking == "Probable" | Confidence.Ranking == "Highly Probable") %>% select(Genus, Trophic.Mode) %>% rename("FG_genus_given" = "Trophic.Mode")
+
+########################### Family level summary ###########################
+Fungi_FG_family <- read.csv("3_Fungi classification/Fungi_FG.csv") %>% mutate(Binomial = Taxon) %>% filter(Rank == "Family") %>% filter(Confidence.Ranking == "Probable" | Confidence.Ranking == "Highly Probable") %>% select(Taxon, Trophic.Mode) %>% rename("FG_Family" = "Trophic.Mode") %>% rename("Family" = "Taxon")
+
+
+
+##############################################################################################################################
+######################################## Merging FunGuild with PREDICTS data ###################################################
+##############################################################################################################################
+# 1. Fungi trophic level data is first merged corresponding to the spp in PREDICTS
+# 2. For PREDICTS data that cannot be identified to the spp, the records are matched to the genus level strategy above
+# 3. The spp classification coalesce with the genus, but keep the original spp-level classification. Put it simply, the genus-classification only 'patches' empty rows. 
+# 4. For PREDICTS data that cannot be identified to the spp, the records are matched to the family level strategy above
+# 5. The genus classification coalesce with the family, but keep the original spp-level classification. Put it simply, the family-classification only 'patches' empty rows. 
+
+Fungi_FGSorted <- dplyr::left_join(Fungi, Fungi_FG_spp, by = c("Genus", "Species"))
+Fungi_FGSorted <- dplyr::left_join(Fungi_FGSorted, FungiGenus, by = "Genus")
+Fungi_FGSorted  <- Fungi_FGSorted  %>% mutate(FG_given_patched = coalesce(FG_spp, FG_genus_given))
+
+Fungi_FGSorted <- dplyr::left_join(Fungi_FGSorted, FungiSpp %>% select(Genus, FG_genus), by = "Genus")
+Fungi_FGSorted <- Fungi_FGSorted %>% mutate(FG_Genus_patched = coalesce(FG_given_patched, FG_genus)) 
+
+Fungi_FGSorted <- dplyr::left_join(Fungi_FGSorted, Fungi_FG_family, by = "Family")
+Fungi_FGSorted <- Fungi_FGSorted %>% mutate(FG_Final = coalesce(FG_Genus_patched, FG_Family))
+
+########################### Remove data with undecided land use and intensity ###########################
+Fungi_FGFinal <- Fungi_FGSorted %>% filter(!(Predominant_land_use == "Cannot decide")) %>% filter(!(Use_intensity == "Cannot decide"))
+write.csv(Fungi_FGFinal, "FungiFG.csv") # Not this
+
+write.csv(Fungi_FGSorted, "FungiFG.csv")
+
+
+dplyr::count(Fungi_FGFinal, FG_Final)
+
+```
+
+
+
+
+
+
+

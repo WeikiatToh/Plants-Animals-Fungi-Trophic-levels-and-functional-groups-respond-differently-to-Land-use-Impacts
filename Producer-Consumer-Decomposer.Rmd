@@ -1,0 +1,452 @@
+---
+title: "Effect of time since land use conversion on functional groups"
+author: "JayToh"
+date: '2023-04-15'
+output: html_document
+---
+
+# Library:
+```{r, warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(ggpattern)
+library(DHARMa)
+
+select <- dplyr::select
+
+```
+# Data:
+1. Read in FG sorted-data
+```{r}
+Animals <- read.csv("../2. Grouping/1_Animal classification/Animal.csv") %>% filter(!(Class == "Not assigned")) %>% filter(!(Class == "")) %>% 
+  filter(!(Order == "Not assigned")) %>% filter(!(Order == "")) %>% 
+  filter(!(Family == "Not assigned")) %>% filter(!(Family == "")) %>% dplyr::filter(!(Predominant_land_use == "Cannot decide")) %>% dplyr::filter(!(Use_intensity == "Cannot decide"))
+
+load("../2. Grouping/1_Animal classification/SitesTrophicLevels.Rd")
+
+
+Plants <- read.csv("PlantFG.csv") %>%  dplyr::filter(!(Predominant_land_use == "Cannot decide")) %>% dplyr::filter(!(Use_intensity == "Cannot decide"))
+
+Fungi <- read.csv("FungiFG.csv") %>% dplyr::filter(!(Predominant_land_use == "Cannot decide")) %>% dplyr::filter(!(Use_intensity == "Cannot decide"))
+
+```
+
+# Summary:
+```{r}
+
+count(Animals, Use_intensity)
+count(Fungi %>% filter(Class == "Tremellomycetes"), Order) %>% select(Order) %>% unlist() 
+
+```
+
+
+# Diversity:
+1. Remove rows without known land use and use intensity 
+2. Merge fine classifications of secondary vegetation (including young, intermediate, mature) to "SV"
+```{r}
+
+############# Function that simplify names #############
+Ezsimplify <- function(df) {
+  A <- df %>% mutate(Land_use = Predominant_land_use) %>% relocate(Land_use, .after = Predominant_land_use) %>% relocate(Use_intensity, .after = Land_use) %>% mutate(Intensity = Use_intensity) %>% relocate(Intensity, .after = Use_intensity)
+  A$Land_use <- dplyr::recode(A$Predominant_land_use,
+                                                       "Primary vegetation" = "PV",
+                                                       "Young secondary vegetation" = "SV",
+                                                       "Intermediate secondary vegetation" = "SV",
+                                                       "Mature secondary vegetation" = "SV",
+                                                       "Secondary vegetation (indeterminate age)" = "SV",
+                                                       "Plantation forest" = "Plantation",
+                                                       "Cropland" = "Crop")
+  A$Intensity <- dplyr::recode(A$Use_intensity,
+                                                       "Minimal use" = "Minimal",
+                                                       "Light use" = "Light",
+                                                       "Intense use" = "Intense")
+  A$SSS <- factor(A$SSS)
+  A$Source_ID <- factor(A$Source_ID)
+  A$SS <- factor(A$SS)
+  A
+}
+
+############# Function that simplify names #############
+Consumers <- Ezsimplify(Animals) 
+Producers <- Ezsimplify(Plants) %>% select(-X, -X.1)
+Decomposers <- Ezsimplify(Fungi) %>% select(-X, -X.1)
+
+
+
+
+
+rm(Animals)
+rm(Plants)
+rm(Fungi)
+
+############# Function for Abundance, spp richness, Chao and Rarefied. Takes long to run!  #############
+
+Ezdiversity <- function(df){
+  A <- predictsFunctions::SiteMetrics(diversity = df,
+                                      extra.cols = c("Longitude",
+                                                     "Latitude",
+                                                     "Land_use",
+                                                     "Intensity",
+                                                     "SSB",
+                                                     "SSBS",
+                                                     "Years_since_fragmentation_or_conversion",
+                                                     "Country",
+                                                     "Biome",
+                                                     "Habitat_patch_area_square_metres",
+                                                     "Km_to_nearest_edge_of_habitat",
+                                                     "FG_Final"))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+  A
+}
+
+
+################################### Diversity for each FG. ###################################
+# Tried removing records without land use and intensity before and after the Ezdiversity function, but it does not affect the Chao and rarefied diversity estimate.
+Consumers_diversity <- Ezdiversity(Consumers) # 371 sources, 494 studies and 13783 sites
+Producers_diversity <- Ezdiversity(Producers) # 95 sources, 115 studies and 4905 sites, Chao and rarefied NA
+Decomposer_diversity <- Ezdiversity(Decomposers) # 14 sources, 17 studies and 581 sites, Chao and rarefied NA
+
+dplyr::count(Decomposers, Diversity_metric_is_suitable_for_Chao)
+
+
+##### Empty rows in Yeasrs since conversion
+Empty <- dplyr::count(Decomposer_diversity, Years_since_fragmentation_or_conversion) 
+# Consumers = 10949
+# Producer = 3815
+# Decomposers = 547
+
+
+```
+
+
+## Spp richness Plot
+```{r, fig.width=20, fig.height=10}
+Consumers_diversity %>% group_by(Land_use, Use_intensity) %>% summarise(MeanSR = mean(Species_richness),
+                                                                        SDSR = sd(Species_richness))
+nrow(Consumers_diversity %>% filter(Land_use == "Crop"))
+
+
+#################### Spp richness plot function ####################
+#  future use: Use_color <- c("PV" = "Darkgreen", "SV" = "darkseagreen", "Plantation" = "darkolivegreen2", "Pasture" = "darkgoldenrod1", "Crop" = "darkorange", "Urban" = "coral2")
+
+EzplotSR <- function(df, x) {
+  A <- df %>%  group_by(Land_use, Intensity) %>% summarise(MeanSR = mean(Species_richness, na.rm = TRUE),
+                                                           SDSR = sd(Species_richness, na.rm = TRUE),
+                                                           n = length(Land_use),
+                                                           SESR = 1.96 * SDSR/sqrt(n))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+
+  Intensity_col <- c("Minimal" = "Darkgreen", "Light" = "darkgoldenrod1", "Intense" = "coral2")
+  ggplot() + 
+    geom_col(data = A, aes(x = Land_use, y = MeanSR, group = Intensity, fill = Intensity), position = "dodge2", col = "black") + 
+    geom_errorbar(data = A, aes(x = Land_use, ymin = MeanSR-SESR, ymax = MeanSR+SESR, group = Intensity), position = position_dodge2(width = 0.5, padding = 0.5)) +
+    theme_classic() +
+    scale_fill_manual(name = "Land use intensity", values = Intensity_col) + labs(y = "Mean Species richness", x = "Land uses", title = x)
+  
+}
+
+#################### Spp richness plots ####################
+ggarrange(EzplotSR(Consumers_diversity, "Consumers' diversity across land uses and intensities"),
+          EzplotSR(Producers_diversity, "Producers' diversity across land uses and intensities"),
+          EzplotSR(Decomposer_diversity, "Decomposers' diversity across land uses and intensities"))
+```
+
+
+## Total abundance plot:
+```{r, fig.width=20, fig.height=10}
+#################### Total Abundance plot function ####################
+EzplotAbund <- function(df, x) {
+  A <- df %>%  group_by(Land_use, Intensity) %>% summarise(MeanAbund = mean(Total_abundance, na.rm = TRUE),
+                                                           SDAbund = sd(Total_abundance, na.rm = TRUE),
+                                                           n = length(Land_use),
+                                                           SEAbund = 1.96 * SDAbund/sqrt(n))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+
+  Intensity_col <- c("Minimal" = "Darkgreen", "Light" = "darkgoldenrod1", "Intense" = "coral2")
+  ggplot() + 
+    geom_col(data = A, aes(x = Land_use, y = MeanAbund, group = Intensity, fill = Intensity), position = "dodge2", col = "black") + 
+    geom_errorbar(data = A, aes(x = Land_use, ymin = MeanAbund-SEAbund, ymax = MeanAbund+SEAbund, group = Intensity), position = position_dodge2(width = 0.5, padding = 0.5)) +
+    theme_classic() +
+    scale_fill_manual(name = "Land use intensity", values = Intensity_col) + labs(y = "Mean Abundance", x = "Land uses", title = x)
+  }
+
+
+ggarrange(EzplotAbund(Consumers_diversity, "Consumers' abundance across land uses and intensities"),
+          EzplotAbund(Producers_diversity, "Producers' abundance across land uses and intensities"),
+          EzplotAbund(Decomposer_diversity, "Decomposers' abundance across land uses and intensities"))
+
+EzplotAbund(Consumers_diversity, "Consumers' abundance across land uses and intensities")
+EzplotAbund(Producers_diversity, "Producers' abundance across land uses and intensities")
+
+```
+
+# Lon, Lat, Land use
+```{r}
+Consumers_lonlat <- Consumers_diversity %>% select(Longitude, Latitude, Land_use, Years_since_fragmentation_or_conversion) %>% 
+  filter(is.na(Years_since_fragmentation_or_conversion)) %>% group_by(Longitude, Latitude, Land_use) %>% summarise(Years_since = sum(Years_since_fragmentation_or_conversion))
+
+Producers_lonlat <- Producers_diversity %>% select(Longitude, Latitude, Land_use, Years_since_fragmentation_or_conversion) %>% 
+  filter(is.na(Years_since_fragmentation_or_conversion)) %>% group_by(Longitude, Latitude, Land_use) %>% summarise(Years_since = sum(Years_since_fragmentation_or_conversion))
+
+Decomposers_lonlat <- Decomposer_diversity %>% select(Longitude, Latitude, Land_use, Years_since_fragmentation_or_conversion) %>% 
+  filter(is.na(Years_since_fragmentation_or_conversion)) %>% group_by(Longitude, Latitude, Land_use) %>% summarise(Years_since = sum(Years_since_fragmentation_or_conversion))
+
+```
+
+##  Matching
+E.g. 
+59.125
+59.375
+59.625
+59.875
+60.125
+
+0.125
+0.375
+0.625
+0.875
+
+```{r}
+# Export 
+
+write.csv(Consumers_lonlat, "Consumers_lonlat.csv")
+
+```
+
+
+
+
+# Mixed-effect Models
+## Model function;
+```{r}
+# Function for model
+
+Ezmodel <- function(DF, expvar, FE1, FE2, FE3, FE4, FE5, RE){
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  B <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE2,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  C <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE3,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  D <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE4,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  E <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE5,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  AIC1 <- AIC(A$model, B$model, C$model, D$model, E$model)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Variable = c(FE1, FE2, FE3, FE4, FE5)) %>% relocate(Variable)
+  AIC2
+}
+
+######################################################## IGNORE: Testing ########################################################
+##### Land use * Intensity #####
+ConMod1 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use*Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+StatisticalModels::GLMEROverdispersion(model = ConMod1$model) # No overdispersion!
+##### Land use + Intensity ##### 
+ConMod1.1 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use+Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+##### Land use ##### 
+ConMod1.2 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+##### Intensity ##### 
+ConMod1.3 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+####################### Random effect #######################:
+ConModNULL <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "1",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+```
+
+
+## Consumer models:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+
+Consumer_model <- Ezmodel(Consumers_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+
+ConMod1.2 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+
+# Model assumptions:
+summary(ConMod1.2$model)
+plot(simulateResiduals(ConMod1.2$model))
+
+
+# Variance explained:
+R2GLMER(ConMod1.2$model) # 0.0004568018
+
+sat <- StatisticalModels::SpatialAutocorrelationTest(ConMod1.2,ranefGrouping = "SS")
+```
+
+## Producer:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+##### Using the above function #####
+Producer_model <- Ezmodel(Producers_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+
+
+ProMod1 <- StatisticalModels::GLMER(modelData = Producers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use*Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+AIC(ProMod1$model)
+
+
+# Model assumptions #
+summary(ProMod1$model)
+plot(simulateResiduals(ProMod1$model))
+
+
+# Variance explained:
+R2GLMER(ProMod1$model) # 0.004174661
+
+
+```
+
+## Decomposer:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+##### Using the above function #####
+Decomposer_model <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+Decomposer_model1 <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Intensity*Biome", 
+        "Intensity+Biome", 
+        "Biome", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)")
+Decomposer_model2 <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Intensity*Biome*Intensity", 
+        "Intensity+Biome+Intensity", 
+        "Biome+Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)")
+
+DecNULL <- StatisticalModels::GLMER(modelData = Decomposer_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "1",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+
+plot(simulateResiduals(DecNULL$model))
+
+
+# Variance explained:
+R2GLMER(DecNULL$model) #0
+
+
+```
+
+## Graph Combined:
+```{r, fig.width=15, fig.height=5}
+
+par(mfrow = c(1,2)) 
+PlotGLMERFactor(model = ConMod1.2$model, data = ConMod1.2$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Consumer Species richness")
+
+PlotGLMERFactor(model = ProMod1$model,data = ProMod1$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = c("Land_use", "Intensity") ,xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)), 
+                main = "Producer Species richness")
+          
+PlotGLMERFactor(model = DecNULL$model,data = DecNULL$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)), main = "Decomposer Species richness")
+
+
+```
+
+
