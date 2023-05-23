@@ -1,0 +1,251 @@
+---
+title: "Trophic level Land use modelling"
+author: "JayToh"
+date: '2023-05-15'
+output: html_document
+---
+
+# Library
+```{r}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(DHARMa)
+
+select <- dplyr::select
+```
+
+# Final Data
+Diversity data with gridded locations, diversity, and Years_since_conversion patched
+```{r}
+
+```
+
+# Mixed-effect Models
+## Model function;
+```{r}
+# Function for model
+
+Ezmodel <- function(DF, expvar, FE1, FE2, FE3, FE4, FE5, RE){
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  B <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE2,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  C <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE3,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  D <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE4,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  E <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE5,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"))
+  AIC1 <- AIC(A$model, B$model, C$model, D$model, E$model)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Variable = c(FE1, FE2, FE3, FE4, FE5)) %>% relocate(Variable)
+  AIC2
+}
+
+######################################################## IGNORE: Testing ########################################################
+##### Land use * Intensity #####
+ConMod1 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use*Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+StatisticalModels::GLMEROverdispersion(model = ConMod1$model) # No overdispersion!
+##### Land use + Intensity ##### 
+ConMod1.1 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use+Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+##### Land use ##### 
+ConMod1.2 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+##### Intensity ##### 
+ConMod1.3 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+####################### Random effect #######################:
+ConModNULL <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "1",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+```
+
+
+## Consumer models:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+
+Consumer_model <- Ezmodel(Consumers_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+
+ConMod1.2 <- StatisticalModels::GLMER(modelData = Consumers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+
+# Model assumptions:
+summary(ConMod1.2$model)
+plot(simulateResiduals(ConMod1.2$model))
+
+
+# Variance explained:
+R2GLMER(ConMod1.2$model) # 0.0004568018
+
+sat <- StatisticalModels::SpatialAutocorrelationTest(ConMod1.2,ranefGrouping = "SS")
+```
+
+## Producer:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+##### Using the above function #####
+Producer_model <- Ezmodel(Producers_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+
+
+ProMod1 <- StatisticalModels::GLMER(modelData = Producers_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use*Intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+AIC(ProMod1$model)
+
+
+# Model assumptions #
+summary(ProMod1$model)
+plot(simulateResiduals(ProMod1$model))
+
+
+# Variance explained:
+R2GLMER(ProMod1$model) # 0.004174661
+
+
+```
+
+## Decomposer:
+1. Mixed effect model with SSB, but overdispersion
+2. Mixed effect model with SSBS = good
+3. Null model
+```{r}
+##### Using the above function #####
+Decomposer_model <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Land_use*Intensity", 
+        "Land_use+Intensity", 
+        "Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)")
+Decomposer_model1 <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Intensity*Biome", 
+        "Intensity+Biome", 
+        "Biome", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)")
+Decomposer_model2 <- Ezmodel(Decomposer_diversity, 
+        "Species_richness", 
+        "Intensity*Biome*Intensity", 
+        "Intensity+Biome+Intensity", 
+        "Biome+Land_use", 
+        "Intensity", 
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)")
+
+DecNULL <- StatisticalModels::GLMER(modelData = Decomposer_diversity,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "1",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"))
+
+plot(simulateResiduals(DecNULL$model))
+
+
+# Variance explained:
+R2GLMER(DecNULL$model) #0
+
+
+```
+
+## Graph Combined:
+```{r, fig.width=15, fig.height=5}
+
+par(mfrow = c(1,2)) 
+PlotGLMERFactor(model = ConMod1.2$model, data = ConMod1.2$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Consumer Species richness")
+
+PlotGLMERFactor(model = ProMod1$model,data = ProMod1$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = c("Land_use", "Intensity") ,xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)), 
+                main = "Producer Species richness")
+          
+PlotGLMERFactor(model = DecNULL$model,data = DecNULL$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 45,
+                order = c(1, 2, 3, 4, 5, 6, 7 ,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)), main = "Decomposer Species richness")
+
+
+```
