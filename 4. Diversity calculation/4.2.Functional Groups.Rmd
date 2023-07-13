@@ -1,0 +1,155 @@
+---
+title: "Function groups diversity"
+author: "JayToh"
+date: '2023-05-17'
+output: html_document
+---
+
+# Library:
+```{r, warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(DHARMa)
+library(tibble)
+
+select <- dplyr::select
+
+```
+
+# Data:
+1. Read in FG sorted-data
+2. Remove lands whose land use and use intensity cannot be decided
+```{r}
+Animals <- readRDS("1.Animals_converted.rds")
+Plants <- readRDS("2.Plants_converted.rds")
+Fungi <- readRDS("3.Fungi_converted.rds")
+
+```
+
+# Renaming the funcitonal group
+Change Consumers and Producers functional groups 
+```{r}
+Animals <- Animals %>% rename("FG_Final" = "Adult_Trophic_level_Category")
+Plants <- Plants %>% rename("FG_Final" = "CSR_Final")
+
+```
+
+
+# Diversity for each FG
+## Functions
+```{r}
+############# Function for Abundance, spp richness, Chao and Rarefied. Takes long to run!  #############
+EzdiversityFG <- function(df, strategy){
+  AAA <- df %>% filter(FG_Final == strategy)
+  AA <- droplevels(AAA)
+  A <- predictsFunctions::SiteMetrics(diversity = AA,
+                                      extra.cols = c("Longitude",
+                                                     "Latitude",
+                                                     "Land_use",
+                                                     "Intensity",
+                                                     "SSB",
+                                                     "SSBS",
+                                                     "Years_since_fragmentation_or_conversion",
+                                                     "First_conversion",
+                                                     "Since_first_conversion",
+                                                     "Last_conversion",
+                                                     "Since_Last_conversion",
+                                                     "Country",
+                                                     "Biome",
+                                                     "Habitat_patch_area_square_metres",
+                                                     "Km_to_nearest_edge_of_habitat"))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+  B <- A %>% mutate(FG = strategy) %>% relocate(FG)
+  B
+}
+
+```
+
+## Animals:
+Carnivore	501779			
+Detritivore	162063			
+Fungivore	145662			
+Herbivore	536897			
+Non-feeding	6381			
+Omnivore	84939			
+NA	201778
+```{r}
+### checking ###
+dplyr::count(Animals, FG_Final)
+
+### Can take a while to run, be patient! ###
+Animals_Carnivore <- EzdiversityFG(Animals, "Carnivore")
+Animals_Herbivore <- EzdiversityFG(Animals, "Herbivore")
+Animals_Omnivore <- EzdiversityFG(Animals, "Omnivore") # Warning
+
+Testing <- EzdiversityFG(Animals, "Omnivore")
+
+### Final dataset here ###
+Animals_FG <- rbind(Animals_Carnivore, Animals_Herbivore, Animals_Omnivore)
+```
+
+
+## Plant CSR
+1. C, S, and R SiteMetric function for each function group
+2. Drop level
+3.SiteMetric
+4. EzdiversityFG
+
+```{r}
+################################### Diversity for each TL. ###################################
+# EzdiversityFG
+Plants_C <- EzdiversityFG(Plants, "C") # Warning for rarefied
+Plants_S <- EzdiversityFG(Plants, "S")
+Plants_R <- EzdiversityFG(Plants, "R")
+
+# Final dataset here
+Plants_FG <- rbind(Plants_C, Plants_R, Plants_S)
+
+```
+
+## Fungi Saprotroph, symbiotroph, pathotroph
+```{r}
+
+Fungi_Sym <- EzdiversityFG(Fungi, "Symbiotroph")
+Fungi_Sapro <- EzdiversityFG(Fungi, "Saprotroph")
+Fungi_Path <- EzdiversityFG(Fungi, "Pathotroph")
+
+
+# Final dataset here
+Fungi_FG <- rbind(Fungi_Sym, Fungi_Sapro, Fungi_Path)
+
+```
+
+
+# Remove undecided land uses and intensities:
+```{r}
+
+AnimalsFG_clean <- Animals_FG %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity))  
+PlantsFG_clean <- Plants_FG %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity))  
+FungiFG_clean <- Fungi_FG %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity)) 
+
+## Check ##
+dplyr::count(AnimalsFG_clean, Land_use) # Good
+dplyr::count(AnimalsFG_clean, Use_intensity) # Good
+dplyr::count(PlantsFG_clean, Land_use) # Good
+dplyr::count(PlantsFG_clean, Use_intensity) # Good
+dplyr::count(FungiFG_clean, Land_use) # Good
+dplyr::count(FungiFG_clean, Use_intensity) # Good
+```
+
+
+## Exporting:
+```{r}
+saveRDS(AnimalsFG_clean, "B1.AnimalsFG_clean.rds")
+saveRDS(PlantsFG_clean, "B2.PlantsFG_clean.rds")
+saveRDS(FungiFG_clean, "B3.FungiFG_clean.rds")
+
+```
+

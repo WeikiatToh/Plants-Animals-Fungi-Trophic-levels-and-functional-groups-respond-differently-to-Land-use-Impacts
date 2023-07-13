@@ -1,0 +1,177 @@
+---
+title: "Trophic levels"
+author: "JayToh"
+date: '2023-04-15'
+output: html_document
+---
+
+# Library:
+```{r, warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(DHARMa)
+
+select <- dplyr::select
+
+```
+
+# Data:
+1. Read the data from 3.Sorting
+```{r}
+Consumers <- readRDS("1.Animals_converted.rds")
+Producers <- readRDS("2.Plants_converted.rds")
+Decomposers <- readRDS("3.Fungi_converted.rds")
+
+```
+
+
+# Diversity:
+1. Calculate Total abundance, richness, Chao, rarefied, Simposon
+```{r}
+############# Function for Abundance, spp richness, Chao and Rarefied. Takes long to run!  #############
+Ezdiversity <- function(df){
+  A <- predictsFunctions::SiteMetrics(diversity = df,
+                                      extra.cols = c("Longitude",
+                                                     "Latitude",
+                                                     "Land_use",
+                                                     "Intensity",
+                                                     "SSB",
+                                                     "SSBS",
+                                                     "Years_since_fragmentation_or_conversion",
+                                                     "Country",
+                                                     "Biome",
+                                                     "First_conversion",
+                                                     "Since_first_conversion",
+                                                     "Last_conversion",
+                                                     "Since_Last_conversion",
+                                                     "Habitat_patch_area_square_metres",
+                                                     "Km_to_nearest_edge_of_habitat"))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+  A
+}
+
+################################### Diversity for each TL. ###################################
+# Tried removing records without land use and intensity before and after the Ezdiversity function, but it does not affect the Chao and rarefied diversity estimate.
+
+Consumers <- droplevels(Consumers)
+
+Consumers_diversity <- Ezdiversity(Consumers) # 385 sources, 518 studies and 16749 sites
+Producers_diversity <- Ezdiversity(Producers) # 97 sources, 118 studies and 5397 sites, Chao and rarefied NA
+Decomposers_diversity <- Ezdiversity(Decomposers) # 14 sources, 17 studies and 581 sites, Chao and rarefied NA
+
+##### Empty rows in Yeasrs since conversion
+Empty <- dplyr::count(Decomposer_diversity, Years_since_fragmentation_or_conversion) 
+# Consumers = 10949
+# Producer = 3815
+# Decomposers = 547
+
+```
+
+
+## Raw Spp richness Plot
+```{r, fig.width=20, fig.height=10}
+Consumers_diversity %>% group_by(Land_use, Use_intensity) %>% summarise(MeanSR = mean(Species_richness),
+                                                                        SDSR = sd(Species_richness))
+nrow(Consumers_diversity %>% filter(Land_use == "Crop"))
+
+
+#################### Spp richness plot function ####################
+#  future use: Use_color <- c("PV" = "Darkgreen", "SV" = "darkseagreen", "Plantation" = "darkolivegreen2", "Pasture" = "darkgoldenrod1", "Crop" = "darkorange", "Urban" = "coral2")
+
+EzplotSR <- function(df, x) {
+  A <- df %>%  group_by(Land_use, Intensity) %>% summarise(MeanSR = mean(Species_richness, na.rm = TRUE),
+                                                           SDSR = sd(Species_richness, na.rm = TRUE),
+                                                           n = length(Land_use),
+                                                           SESR = 1.96 * SDSR/sqrt(n))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+
+  Intensity_col <- c("Minimal" = "Darkgreen", "Light" = "darkgoldenrod1", "Intense" = "coral2")
+  ggplot() + 
+    geom_col(data = A, aes(x = Land_use, y = MeanSR, group = Intensity, fill = Intensity), position = "dodge2", col = "black") + 
+    geom_errorbar(data = A, aes(x = Land_use, ymin = MeanSR-SESR, ymax = MeanSR+SESR, group = Intensity), position = position_dodge2(width = 0.5, padding = 0.5)) +
+    theme_classic() +
+    scale_fill_manual(name = "Land use intensity", values = Intensity_col) + labs(y = "Mean Species richness", x = "Land uses", title = x)
+  
+}
+
+#################### Spp richness plots ####################
+ggarrange(EzplotSR(Consumers_diversity, "Consumers' diversity across land uses and intensities"),
+          EzplotSR(Producers_diversity, "Producers' diversity across land uses and intensities"),
+          EzplotSR(Decomposer_diversity, "Decomposers' diversity across land uses and intensities"))
+```
+## Raw Total abundance plot:
+```{r, fig.width=20, fig.height=10}
+#################### Total Abundance plot function ####################
+EzplotAbund <- function(df, x) {
+  A <- df %>%  group_by(Land_use, Intensity) %>% summarise(MeanAbund = mean(Total_abundance, na.rm = TRUE),
+                                                           SDAbund = sd(Total_abundance, na.rm = TRUE),
+                                                           n = length(Land_use),
+                                                           SEAbund = 1.96 * SDAbund/sqrt(n))
+  A$Land_use <- factor(A$Land_use, levels = c("PV", "SV", "Plantation", "Pasture", "Crop", "Urban"))
+  A$Intensity <- factor(A$Intensity, levels = c("Minimal", "Light", "Intense"))
+
+  Intensity_col <- c("Minimal" = "Darkgreen", "Light" = "darkgoldenrod1", "Intense" = "coral2")
+  ggplot() + 
+    geom_col(data = A, aes(x = Land_use, y = MeanAbund, group = Intensity, fill = Intensity), position = "dodge2", col = "black") + 
+    geom_errorbar(data = A, aes(x = Land_use, ymin = MeanAbund-SEAbund, ymax = MeanAbund+SEAbund, group = Intensity), position = position_dodge2(width = 0.5, padding = 0.5)) +
+    theme_classic() +
+    scale_fill_manual(name = "Land use intensity", values = Intensity_col) + labs(y = "Mean Abundance", x = "Land uses", title = x)
+  }
+
+
+ggarrange(EzplotAbund(Consumers_diversity, "Consumers' abundance across land uses and intensities"),
+          EzplotAbund(Producers_diversity, "Producers' abundance across land uses and intensities"),
+          EzplotAbund(Decomposer_diversity, "Decomposers' abundance across land uses and intensities"))
+
+EzplotAbund(Consumers_diversity, "Consumers' abundance across land uses and intensities")
+EzplotAbund(Producers_diversity, "Producers' abundance across land uses and intensities")
+
+```
+
+# Remove Undecided land uses and intensity:
+Note to self: Put this later after the siteMetric function. Can remove there.
+1. Remove rows without known land use and use intensity 
+```{r}
+Consumers_clean <- Consumers_diversity %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity))  
+Producers_clean <- Producers_diversity %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity))  
+Decomposers_clean <- Decomposers_diversity %>% filter(!is.na(Land_use)) %>% filter(!is.na(Intensity))  
+
+
+## Check ##
+dplyr::count(Consumers_clean, Land_use) # Good
+dplyr::count(Consumers_clean, Use_intensity) # Good
+dplyr::count(Producers_clean, Land_use) # Good
+dplyr::count(Producers_clean, Use_intensity) # Good
+dplyr::count(Decomposers_clean, Land_use) # Good
+dplyr::count(Decomposers_clean, Use_intensity) # Good
+
+## NAs in Last_conversion ##
+dplyr::count(Consumers_diversity, Last_conversion) # 264
+dplyr::count(Producers_diversity, Last_conversion) # 2
+dplyr::count(Decomposers_diversity, Last_conversion)
+```
+
+# Export data for modelling
+```{r}
+saveRDS(Consumers_clean, "A1.Consumers_clean.rds")
+saveRDS(Producers_clean, "A2.Producers_clean.rds")
+saveRDS(Decomposers_clean, "A3.Decomposers_clean.rds")
+
+
+# Checking
+
+```
+
+
+
+
+
+
