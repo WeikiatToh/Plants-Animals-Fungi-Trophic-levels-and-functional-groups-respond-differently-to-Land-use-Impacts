@@ -1,0 +1,482 @@
+---
+title: "HLL (state)"
+author: "JayToh"
+date: '2023-05-08'
+output: html_document
+---
+
+# Library:
+```{r}
+
+library(ncdf4) # package for netcdf manipulation
+library(tidyr)
+library(dplyr)
+library(generics)
+
+```
+https://pjbartlein.github.io/REarthSysSci/netCDF.html 
+https://towardsdatascience.com/how-to-crack-open-netcdf-files-in-r-and-extract-data-as-time-series-24107b70dcd 
+
+# Data:
+1. Open nc file, print (summary)
+     4 dimensions:
+        time  Size:1166   *** is unlimited *** 
+            units: years since 850-01-01 0:0:0
+            calendar: noleap
+            long_name: time
+            standard_name: time
+            axis: T
+        lat  Size:720 
+            units: degrees_north
+            long_name: latitude
+            standard_name: latitude
+            axis: Y
+        lon  Size:1440 
+            units: degrees_east
+            long_name: longitude
+            standard_name: longitude
+            axis: X
+        bounds  Size:2 (no dimvar)
+```{r}
+
+Historical_Land <- nc_open("states.nc")
+print(Historical_Land)
+
+```
+
+# Coordinates matrix: Lon and Lat
+1. ncvar_get the lon and dim + check for range
+2. ncvar_get the lat and dim + check for range
+```{r}
+####### Longitude #######
+lon <- ncvar_get(Historical_Land,"lon")
+dim(lon) # 1440, matched the data
+range(lon) # -179.875 to 179.875
+
+####### Latitude #######
+lat <- ncvar_get(Historical_Land,"lat")
+dim(lat) # 720, matched the data
+range(lat) # -89.875 to 89.875
+
+
+############## Lon Lat matrix ############## 
+lonlat <- as.matrix(expand.grid(lon, lat))
+```
+
+## Coordinates DF
+1. Convert gridded locations into range values by adding or subtracting 0.125
+2. Stack together rows with the same latitudes and longitudes to identify unique locations
+```{r}
+# Convert lon lat matrix to dataframe and rename them
+Ezlonlat <- function(matrix_data) {
+  A <- matrix_data
+  B <- data.frame(A)
+  names(B) <- c("Lon", "Lat")
+  
+  B <- B %>% mutate(Lon_max = Lon + 0.125,
+                    Lon_min = Lon - 0.125,
+                    Lat_max = Lat + 0.125,
+                    Lat_min = Lat - 0.125) %>% relocate(Lat, .before = Lat_max)
+  B
+}
+
+Lonlat_df <- Ezlonlat(lonlat)
+
+# Replicate? Nope, all unique locations
+Testingt <- Lonlat_df %>% select(Lon, Lat) %>% group_by(Lon, Lat) %>% summarise(length(Lon)) #
+
+# Group locations with the same Lon and Lat 
+lon_df <- Lonlat_df %>% select(Lon, Lon_max, Lon_min) %>% mutate(X = 1) %>% group_by(Lon, Lon_max, Lon_min) %>% summarise(Y = sum(X)) %>% select(-Y)
+lat_df <- Lonlat_df %>% select(Lat, Lat_max, Lat_min) %>% mutate(X = 1) %>% group_by(Lat, Lat_max, Lat_min) %>% summarise(Y = sum(X)) %>% select(-Y)
+```
+
+
+
+# Since conversion
+https://stackoverflow.com/questions/42374599/r-return-column-name-based-on-conditions
+
+1. Left_join gridded location from above to the fraction from 850 to 2015
+2. Extract the year falling below 0.7
+3. Remove individual fraction 
+4. Patch the data
+
+```{r}
+##### Left join test #####
+
+ATesting <- dplyr::left_join(Consumers_Final, PV_mat3 %>% rename("Lon_grid" = "Lon", "Lat_grid" = "Lat"), by = c("Lon_grid", "Lat_grid"))
+
+str(ATesting) # 34 to 1198
+ATesting1 <- ATesting[,1:32]
+
+##### Data for extraction #####
+PV_test <- tail(PV_mat3, 20)
+PV_test1 <- PV_test[12:15,] # Dataset for test
+
+##### Ezconversion function #####
+Ezconversion <- function(DF) {
+  A <- DF
+  B <- A %>%  mutate(Last_conversion = apply(DF[,-1:-2], 1, function(x) first(names(which(x <0.7))))) %>% 
+    mutate(Last_conversion = as.numeric(Last_conversion)) %>% 
+    relocate(Last_conversion, .after = Lat)
+  C <- B %>% mutate(Last_conversion_full = Last_conversion) %>% 
+    mutate(Last_conversion_full = as.numeric(Last_conversion_full)) %>% 
+    relocate(Last_conversion_full, .after = Last_conversion) 
+  D <- C %>%  mutate(Last_conversion_full = replace(C$Last_conversion_full, is.na(C$Last_conversion_full), 850),
+                     Since_conversion = 2015 - Last_conversion_full) %>% relocate(Since_conversion, .after = Last_conversion_full)
+  D
+}
+
+PV_test2 <- Ezconversion(PV_test1)
+
+
+##### Raw data for testing #####
+PV_test1 <- PV_test1 %>% mutate(First = apply(PV_test1[,-1:-2], 1, function(x) first(names(which(x <0.7))))) %>% relocate(First)
+```
+
+# Overall time
+1. Adding 850 to the time. This is because time in "state.nc" is years since 850, shown as 0, 1, 2, 3, ... to 1165 (which is 2015)! So, I make it more sensible and convert it to year. After conversion, the time will show as year 850, 851, 852, 853, ... to 2015.
+```{r}
+###### One time code! #####
+# Changing time to start with 850
+Historical_Land$dim$time$vals <- Historical_Land$dim$time$vals + 850
+Historical_Land$dim$time # checking
+
+####### Time #######
+time <- ncvar_get(Historical_Land,"time") + 850
+dim(time) # 1166, matched the data, years since 850-01-01 0:0:0
+range(time) # 850~2015
+
+```
+
+# Reshape the whole array:
+1. Get the variable (e.g. primf, primn, secdf, secn etc)
+2. Get the fillvalue
+3. Patch the fillvalue with NA
+
+## Primf
+```{r}
+
+################################# EZ function to get the variable + fill up NA #################################
+EzVar <- function(var){
+  A <- ncvar_get(Historical_Land, var)
+  fillvalue <- ncatt_get(Historical_Land, var, "_FillValue")
+  A[A==fillvalue$value] <- NA
+  A
+}
+
+Ezmatrix <- function(DF){
+  AA <- EzVar(DF)
+  A <- as.vector(AA)
+  B <- matrix(A, nrow = dim(lon)*dim(lat), ncol = dim(time))
+  C <- data.frame(cbind(lonlat, B)) 
+  names(C) <- c("Lon", "Lat", 849+(seq(1:1166))) # Column name that starts from year 850 to 2015
+  C
+}
+
+Primf <- Ezmatrix("primf")
+
+################################# Manual way: Step-by-step #################################
+## 1. Getting the desired land use
+Primf <- EzVar("primf")
+dim(Primf) # 1440  720 1166 = Lon  Lat  Time
+## 2. Convert to vector
+Primf_long <- as.vector(Primf)
+length(Primf_long)
+## 3. Convert to matrix with lon, lat, time 
+PV_mat <- matrix(Primf_long, nrow = dim(lon)*dim(lat), ncol = dim(time))
+dim(PV_mat)
+## 4. Convert to dataframe by cbining lonlat with the matrix above!
+PV_mat2 <- data.frame(cbind(lonlat, PV_mat))
+## Naming the columns
+names(PV_mat2) <- c("Lon", "Lat", 849+(seq(1:1166)))
+```
+
+## Primn
+```{r}
+################################# Ez function that combines the above "Step-by-step" #################################
+Primn <- Ezmatrix("primn")
+
+##### If the above fails, try this: Step-by-step for Primn #####
+Primn <- EzVar("primn")
+Primn_long <- as.vector(Primn)
+Pn_mat <- matrix(Primn_long, nrow = dim(lon)*dim(lat), ncol = dim(time))
+Pn_mat2 <- data.frame(cbind(lonlat, Pn_mat))
+names(Pn_mat2) <- c("Lon", "Lat", 849+(seq(1:1166)))
+```
+
+## Primfn (Sum)
+Adding Primf and Primn together to form a new dataset called Primfn
+```{r}
+##### Function for adding two dataframes together #####
+Ezgeneralise <- function(DF1, DF2) {
+  A1 <- DF1
+  A1[is.na(A1)] <- 0 # Convert NA to 0 to make addition of two datasets possible. 
+  A2 <- DF2
+  A2[is.na(A2)] <- 0
+  A <- (A1 %>% select(-Lon, -Lat)) + (A2 %>% select(-Lon, -Lat))
+  A <- A %>%  mutate(Lon = DF1$Lon,
+                     Lat = DF1$Lat) %>% relocate(Lon) %>% relocate(Lat, .after = Lon) # List of location same for both dataset, so doesn't matter which.
+  A
+}
+
+Primfn <- Ezgeneralise(Primf, Primn)
+
+
+##### Checking if sum if successful #####
+# -30.625, 82.625
+Primf %>% filter(Lon == -30.625 & Lat == 82.625) # All NA +
+Primn %>% filter(Lon == -30.625 & Lat == 82.625) # All 1
+Primfn %>% filter(Lon == -30.625 & Lat == 82.625) # All 1
+all(Primfn %>% select(-Lon, -Lat) <=1) # True! That is a relief!
+
+EzaddtestLocation <- function(DF1, DF2) {
+  T1 <- na.omit(DF1) %>% select(Lon, Lat)
+  T2 <- na.omit(DF2) %>% select(Lon, Lat)
+  T3 <- generics::intersect(T1, T2)
+  T3
+}
+
+EzaddtestLocation(Primn, Primf)
+
+##### Remove DF when done, save space #####
+rm(Primf)
+rm(Primn)
+
+############# IGNORE: Testing ###############
+T1 <- data.frame(A = c(1, 2, 3),
+                 B = c(NA, 10, 13),
+                 C = c(4, NA, 8))
+
+T2 <- data.frame(A = c(1, 2, 3),
+                 B = c(17, 16, NA),
+                 C = c(5, NA, 8))
+
+  T3 <- sum(T1, T2, na.rm = TRUE)
+T3 <- T3 %>% mutate(A = T1$A) %>% relocate(A)
+
+```
+
+## Secdf
+```{r}
+Secdf <- Ezmatrix("secdf")
+
+```
+
+## Secdn
+```{r}
+Secdn <- Ezmatrix("secdn")
+
+```
+
+
+## Secdfn (Sum)
+Adding Secdf and Secdn together to form Secdfn
+```{r}
+Secdfn <- Ezgeneralise(Secdf, Secdn)
+EzaddtestLocation(Secdf, Secdn)
+
+#### Remove additional DF after summing ####
+rm(Secdn)
+rm(Secdf)
+
+```
+
+## PSfn (Sum)
+Addition Primfn and Secdfn together to form PSfn
+
+List of testing, you can ignore these!
+55.125	89.875			
+55.375	89.875			
+55.625	89.875			
+55.875	89.875			
+56.125	89.875			
+56.375	89.875			
+56.625	89.875			
+56.875	89.875			
+57.125	89.875			
+57.375	89.875	
+35.125	89.875			
+35.375	89.875			
+35.625	89.875			
+35.875	89.875			
+36.125	89.875			
+36.375	89.875			
+36.625	89.875			
+36.875	89.875			
+37.125	89.875			
+37.375	89.875
+```{r}
+PSfn <- Ezgeneralise(Primfn, Secdfn)
+EzaddtestLocation(Primfn, Secdfn)
+
+### -178.375	89.875	
+Ezcheck <- function(DF1, DF2, DFFinal,long, lati){
+  A <- DF1 %>% mutate(Type = "DF1") %>% relocate(Type)
+  B <- DF2 %>% mutate(Type = "DF2") %>% relocate(Type)
+  C <- DFFinal %>% mutate(Type = "DF_Final") %>% relocate(Type)
+  D <- A %>% filter(Lon == long & Lat == lati)
+  E <- B %>% filter(Lon == long & Lat == lati)
+  FF <- C %>% filter(Lon == long & Lat == lati)
+  G <- rbind(D, E, FF)
+  G
+}
+
+### Checking ###
+Ezcheck(Primfn, Secdfn, PSfn, 55.125, 89.875)
+all(PSfn %>% select(-Lon, -Lat) < 1.000001) # Adding up may have some decimal points that exceed 1. No values are above 1.00001, but there are values above 1.000001. Rounding error to the fifth decimal place should be fine.
+
+### Remove extra data ###
+rm(Primfn)
+rm(Secdfn)
+```
+
+## Range:
+```{r}
+Range <- Ezmatrix("range")
+```
+
+## > PSfn_range (Sum)
+Adding Range and PSfn together to form PSfn_range
+```{r}
+PSfn_range <- Ezgeneralise(PSfn, Range)
+all(PSfn_range %>% select(-Lon, -Lat) < 1.00001) # TRUE
+
+#### Remove extra data ####
+rm(Range, PSfn)
+
+### Export Natural data ###
+saveRDS(PSfn_range, file = "Natural.rds")
+write.csv(PSfn_range, "Natural.csv") # This will be the data used in the study!!! 
+```
+
+The following codes focus on extracting and adding artificial lands. The process is the same as the above for natural lands. Theoretically, the 1 - Natural lands = Artificial lands, but it is never too much to check! 
+
+## Urban:
+```{r}
+Urban <- Ezmatrix("urban")
+```
+
+## Pasture
+```{r}
+Pasture <- Ezmatrix("pastr")
+```
+
+## Urban_pasture (Sum)
+```{r}
+Urban_pasture <- Ezgeneralise(Urban, Pasture)
+all(Urban_pasture %>% select(-Lon, -Lat) < 1.000000000001) # TRUE
+
+#### Remove extra data ####
+rm(Urban, Pasture)
+
+```
+
+## C3 plants
+18.625	70.125			
+18.875	70.125			
+19.125	70.125			
+19.375	70.125			
+18.375	69.875			
+18.625	69.875			
+18.875	69.875			
+17.625	69.625			
+17.875	69.625			
+18.125	69.625	
+24.875	64.125			
+25.125	64.125			
+25.375	64.125			
+25.625	64.125			
+25.875	64.125			
+26.125	64.125			
+26.375	64.125			
+26.875	64.125			
+27.125	64.125			
+27.375	64.125	
+```{r}
+C3ann <- Ezmatrix("c3ann")
+C3per <- Ezmatrix("c3per")
+C3nfx <- Ezmatrix("c3nfx")
+
+
+C3annper <- Ezgeneralise(C3ann, C3per)
+
+
+#### Checking if sums are correct ####
+all(C3annper %>% select(-Lon, -Lat) < 1.000000000001) # TRUE
+EzaddtestLocation(C3ann, C3per)
+Ezcheck(C3ann, C3per, C3annper, 26.875, 64.125) # CORRECT!!!!
+
+#### Remove extra data ####
+rm(C3ann, C3per)
+
+
+#### Adding c3nfx to c3annper ####
+C3annpernfx <- Ezgeneralise(C3annper, C3nfx)
+
+all(C3annpernfx %>% select(-Lon, -Lat) < 1.000000000001) # TRUE
+
+#### Remove extra data ####
+rm(C3nfx, C3annper)
+```
+
+## UrbanPC3 (Sum)
+```{r}
+UrbanPC3 <- Ezgeneralise(Urban_pasture, C3annpernfx)
+all(UrbanPC3 %>% select(-Lon, -Lat) < 1.0000001) # TRUE
+
+#### Remove extra data ####
+rm(Urban_pasture, C3annpernfx)
+
+```
+
+## C4 plants
+```{r}
+C4ann <- Ezmatrix("c4ann")
+C4per <- Ezmatrix("c4per")
+
+C4annper <- Ezgeneralise(C4ann, C4per)
+
+#### Checking ####
+all(C4annper %>% select(-Lon, -Lat) < 1.0000001) # TRUE
+
+#### Remove extra data ####
+rm(C4ann, C4per)
+
+```
+
+## > UrbanPC3C4 (Sum)
+```{r}
+UrbanPC3C4 <- Ezgeneralise(C4annper, UrbanPC3)
+
+#### Checking ####
+all(UrbanPC3C4 %>% select(-Lon, -Lat) < 1.00001) # TRUE
+EzaddtestLocation(C4annper, UrbanPC3)
+
+#### Remove extra data ####
+rm(C4annper, UrbanPC3)
+
+saveRDS(UrbanPC3C4, file = "Artificial.rds")
+
+
+#### Checking ####
+# 74.125 17.625
+Ezcheck2 <- function(DF1, DF2,long, lati){
+  A <- DF1 %>% mutate(Type = "DF1") %>% relocate(Type)
+  B <- DF2 %>% mutate(Type = "DF2") %>% relocate(Type)
+
+  D <- A %>% filter(Lon == long & Lat == lati)
+  E <- B %>% filter(Lon == long & Lat == lati)
+
+  G <- rbind(D, E)
+  G
+}
+
+Ezcheck2(PSfn_range, UrbanPC3C4, 74.125, 17.625)
+write.csv(UrbanPC3C4, "Artificial.csv")
+
+Natural <- readRDS("Natural.rds")
+```
+
+
+
+

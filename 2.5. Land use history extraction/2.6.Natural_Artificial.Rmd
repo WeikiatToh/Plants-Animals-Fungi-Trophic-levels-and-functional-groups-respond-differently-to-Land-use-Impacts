@@ -1,0 +1,216 @@
+---
+title: "Natural_Artificial"
+author: "JayToh"
+date: '2023-05-19'
+output: html_document
+---
+
+# Library:
+```{r}
+library(dplyr)
+
+```
+# Since conversion
+https://stackoverflow.com/questions/42374599/r-return-column-name-based-on-conditions
+
+1. Left_join gridded location from above to the fraction from 850 to 2015
+2. Extract the year falling below 0.7
+3. Remove individual fraction 
+4. Patch the data
+
+```{r}
+# < 0.7 = year
+# < 0.7 always = 850 (2015-850)
+# < 0.7 never = 2015 (0)
+
+# > 0.7 = year
+# > 0.7 always = 2015 (0)
+# > 0.7 never = 850 (2015-850)
+
+##### Ezconversion function #####
+Ezconversion <- function(DF) {
+  # Forward from 850 to 2015
+  A <- DF
+  B <- A %>%  mutate(Last_conversion = apply(DF[,-1:-3], 1, function(x) first(names(which(x <0.7))))) %>% 
+    mutate(Last_conversion = as.numeric(Last_conversion)) %>% 
+    relocate(Last_conversion, .after = Lat)
+  C <- B %>% mutate(Last_conversion_forward = Last_conversion) %>% 
+    mutate(Last_conversion_forward = as.numeric(Last_conversion_forward)) %>% 
+    relocate(Last_conversion_forward, .after = Last_conversion) %>% select(-Last_conversion)
+  Final_Forward <- C %>%  mutate(Last_conversion_forward = replace(C$Last_conversion_forward, is.na(C$Last_conversion_forward), 2015),
+                     Since_conversion_forward = 2015 - Last_conversion_forward) %>% 
+    relocate(Since_conversion_forward, .after =   Last_conversion_forward)
+  
+  # Backward from 2015 to 850
+  AA <- DF[, c(1:3, 1169:4)] 
+  A <- AA %>% mutate(Backward_start_more_than_0.7 = `2015` >0.7) %>% relocate(Backward_start_more_than_0.7)
+  
+  A1 <- A %>% filter(Backward_start_more_than_0.7 == FALSE) # If value starts with <0.7, then their first year exceeding 0.7 will be recorded
+  D1 <- A1 %>%  mutate(Last_conversion_backward = apply(A1[,-1:-4], 1, function(x) first(names(which(x >0.7)))))
+  D1 <- D1 %>% mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E1 <- D1 %>%  mutate(Last_conversion_backward = replace(D1$Last_conversion_backward, is.na(D1$Last_conversion_backward), 850),
+                      Since_conversion_backward = 2015 - Last_conversion_backward) # If no values are >0.7, then it has always been converted
+  
+  A2 <- A %>% filter(Backward_start_more_than_0.7 == TRUE) # If value starts with >0.7, then their first year dropping below 0.7 will be recorded
+  D2 <- A2 %>%  mutate(Last_conversion_backward = apply(A2[,-1:-4], 1, function(x) first(names(which(x <0.7))))) 
+  D2 <- D2 %>%  mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E2 <- D2 %>%  mutate(Last_conversion_backward = replace(D2$Last_conversion_backward, is.na(D2$Last_conversion_backward), 2015),
+                      Since_conversion_backward = 2015 - Last_conversion_backward)  # If no values are <0.7, then it has never been converted
+  Final_Backward <- rbind(E1, E2) %>% select(Is_zero, Lon, Lat, Last_conversion_backward, Since_conversion_backward)
+  
+  # Final dataset combining forward and backward results into one
+  Final <- dplyr::left_join(Final_Forward, Final_Backward, by = c("Is_zero" ,"Lon", "Lat")) %>% relocate(Last_conversion_backward, .after = Last_conversion_forward) %>% relocate(Since_conversion_backward, .after = Since_conversion_forward) 
+  Final
+}
+
+
+```
+
+```{r}
+####### Function for checking ######
+Ezconversionback <- function(DF) {
+  AA <- DF[, c(1:3, 1169:4)] 
+  A <- AA %>% mutate(Backward_start_more_than_0.7 = `2015` >0.7) %>% relocate(Backward_start_more_than_0.7)
+  
+  A1 <- A %>% filter(Backward_start_more_than_0.7 == FALSE) # If value starts with <0.7, then their first year exceeding 0.7 will be recorded
+  D1 <- A1 %>%  mutate(Last_conversion_backward = apply(A1[,-1:-4], 1, function(x) first(names(which(x >0.7)))))
+  D1 <- D1 %>% mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E1 <- D1 %>%  mutate(Last_conversion_backward = replace(D1$Last_conversion_backward, is.na(D1$Last_conversion_backward), 850),
+                      Since_conversion_backward = 2015 - Last_conversion_backward)
+  
+  A2 <- A %>% filter(Backward_start_more_than_0.7 == TRUE) # If value starts with >0.7, then their first year dropping below 0.7 will be recorded
+  D2 <- A2 %>%  mutate(Last_conversion_backward = apply(A2[,-1:-4], 1, function(x) first(names(which(x <0.7))))) 
+  D2 <- D2 %>%  mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E2 <- D2 %>%  mutate(Last_conversion_backward = replace(D2$Last_conversion_backward, is.na(D2$Last_conversion_backward), 2015),
+                      Since_conversion_backward = 2015 - Last_conversion_backward)  
+  Final_Backward <- rbind(E1, E2) %>% select(Is_zero, Lon, Lat, Last_conversion_backward, Since_conversion_backward)
+  Final_Backward
+}
+```
+
+
+# Natural:
+## Original data:
+```{r}
+Natural <- readRDS("1.Natural.rds")
+```
+
+## Remove data with no values (or 0)
+```{r}
+#################### Method 1: Check if all the columns of a location are equal to 0. If yes, TRUE. If not, FALSE  ####################
+# Allows for 0s at some years
+Natural <- Natural %>% mutate(Is_zero = if_all(3:1168, `==`, 0)) %>% relocate(Is_zero) # Columns with 0s across implies those locations have NA values
+
+Natural_Clean <- Natural %>% filter(Is_zero == FALSE) # Subset only regions that have a non-NA values (or non-0 values), result is 247,630 observations, 1169 variables
+
+rm(Natural) # Remove original dataset to save storage
+
+#################### Method 2: Treat all 0s as NA and na.omit() ####################
+Natural[Natural == 0] <- NA
+Natural_NAomit <- na.omit(Natural %>% select(-Is_zero)) # Remove any rows with NA, result is 246,985 observations, 1168 variables
+T1 <- Natural[,3:1166]
+```
+
+## Natural since conversion: <0.7
+```{r}
+Natural_conversion <- Ezconversion(Natural_Clean)
+rm(Natural_Clean)
+
+############################# Testing VERY USEFUL XD #############################
+#### Using small dataset to check ####
+# Result should be that Testing 3 = Testing 4 to be successful
+Testing1 <- rbind(Natural_Clean %>% filter(Lon == -4.375, Lat == 55.875),
+                  Natural_Clean %>% filter(Lon == 37.875, Lat == 14.375),
+                  Natural_Clean %>% filter(Lon == -94.625, Lat == 47.625))
+Testing3 <- Ezconversion(Testing1)
+
+#### Using full dataset and subset the same locations to check ####
+Testing4 <- rbind(Natural_conversion %>% filter(Lon == -4.375, Lat == 55.875),
+                  Natural_conversion %>% filter(Lon == 37.875, Lat == 14.375),
+                  Natural_conversion %>% filter(Lon == -38.375, Lat == -4.375
+))
+
+```
+
+## Export data:
+```{r}
+saveRDS(Natural_conversion, "Natural_conversion.rds")
+```
+
+# Artificial:
+## Function:
+```{r}
+EzconversionArt <- function(DF) {
+  # Forward from 850 to 2015
+  A <- DF
+  B <- A %>%  mutate(Last_conversion = apply(DF[,-1:-3], 1, function(x) first(names(which(x > 0.3))))) %>% 
+    mutate(Last_conversion = as.numeric(Last_conversion)) %>% 
+    relocate(Last_conversion, .after = Lat) # The columns [,1:3] are Is_zero, Lon, and Lat. We want to start the function(x) after these columns. 
+  C <- B %>% mutate(Last_conversion_forward = Last_conversion) %>% 
+    mutate(Last_conversion_forward = as.numeric(Last_conversion_forward)) %>% 
+    relocate(Last_conversion_forward, .after = Last_conversion) %>% select(-Last_conversion)
+  Final_Forward <- C %>%  mutate(Last_conversion_forward = replace(C$Last_conversion_forward, is.na(C$Last_conversion_forward), 2015),
+                     Since_conversion_forward = 2015 - Last_conversion_forward) %>% 
+    relocate(Since_conversion_forward, .after =   Last_conversion_forward)
+  
+  # Backward from 2015 to 850
+  AA <- DF[, c(1:3, 1169:4)] 
+  A <- AA %>% mutate(Backward_start_more_than_0.3 = `2015` >0.3) %>% relocate(Backward_start_more_than_0.3)
+  
+  A1 <- A %>% filter(Backward_start_more_than_0.3 == FALSE) # If value starts with <0.3, then their first year exceeding 0.3 will be recorded
+  D1 <- A1 %>%  mutate(Last_conversion_backward = apply(A1[,-1:-4], 1, function(x) first(names(which(x >0.3)))))
+  D1 <- D1 %>% mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E1 <- D1 %>%  mutate(Last_conversion_backward = replace(D1$Last_conversion_backward, is.na(D1$Last_conversion_backward), 2015),
+                      Since_conversion_backward = 2015 - Last_conversion_backward) # If no values >0.3, then it has never been converted
+  
+  A2 <- A %>% filter(Backward_start_more_than_0.3 == TRUE) # If value starts with >0.3, then their first year below 0.3 will be recorded
+  D2 <- A2 %>%  mutate(Last_conversion_backward = apply(A2[,-1:-4], 1, function(x) first(names(which(x <0.3))))) 
+  D2 <- D2 %>%  mutate(Last_conversion_backward = as.numeric(Last_conversion_backward)) %>% relocate(Last_conversion_backward)
+  E2 <- D2 %>%  mutate(Last_conversion_backward = replace(D2$Last_conversion_backward, is.na(D2$Last_conversion_backward), 850),
+                      Since_conversion_backward = 2015 - Last_conversion_backward) # If no values <0.3, it has always been converted
+  Final_Backward <- rbind(E1, E2) %>% select(Is_zero, Lon, Lat, Last_conversion_backward, Since_conversion_backward)
+  
+  # Final dataset combining forward and backward results into one
+  Final <- dplyr::left_join(Final_Forward, Final_Backward, by = c("Is_zero" ,"Lon", "Lat")) %>% relocate(Last_conversion_backward, .after = Last_conversion_forward) %>% relocate(Since_conversion_backward, .after = Since_conversion_forward) 
+  Final
+}
+```
+
+
+## Original Data
+```{r}
+Artificial <- readRDS("2.Artificial.rds") %>% mutate(Is_zero = if_all(3:1168, `==`, 0)) %>% relocate(Is_zero)
+```
+
+## Remove data without values (or 0)
+```{r}
+Artificial_Clean <- Artificial %>% filter(Is_zero == FALSE) # remove 84.34% of data
+
+rm(Artificial) # save storage
+```
+
+## Artificial since conversion:
+```{r}
+Artificial_conversion <- EzconversionArt(Artificial_Clean)
+
+#### Checking ####
+
+Testing5 <- rbind(Artificial_Clean %>% filter(Lon == -116.125, Lat == 58.375),
+                  Artificial_Clean %>% filter(Lon == 6.125, Lat == 50.125),
+                  Artificial_Clean %>% filter(Lon == 78.625, Lat == 10.625)) 
+
+Testing6 <- EzconversionArt(Testing5) # May fail in a small dataset because you need values in 2015 that are smaller and larger than 0.3. If one is absent, then the function will cause an error!
+
+Testing7 <- rbind(Artificial_conversion %>% filter(Lon == -116.125, Lat == 58.375),
+                  Artificial_conversion %>% filter(Lon == 6.125, Lat == 50.125),
+                  Artificial_conversion %>% filter(Lon == 78.625, Lat == 10.625))
+
+
+```
+
+
+## Export
+```{r}
+saveRDS(Artificial_conversion, "Artificial_conversion.rds")
+  ```
+
