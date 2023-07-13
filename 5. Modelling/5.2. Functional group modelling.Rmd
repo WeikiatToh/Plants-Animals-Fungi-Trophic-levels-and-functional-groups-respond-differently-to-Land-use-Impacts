@@ -1,0 +1,2497 @@
+---
+title: "Trophic level modelling"
+author: "JayToh"
+date: '2023-06-01'
+output: html_document
+---
+
+# Library
+```{r, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(DHARMa)
+library(lme4)
+library(qpcR)
+library(devtools)
+library(MASS)
+library(lmtest)
+library(glmmTMB)
+library(scales)
+library(grid)
+library(ggplotify)
+
+select <- dplyr::select
+```
+
+# Final Datasets here
+Trophic level data:
+```{r}
+###### Trophic levels ######
+B1_Animals <- readRDS("B1.AnimalsFG_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+B2_Plants <- readRDS("B2.PlantsFG_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+B3_Fungi <- readRDS("B3.FungiFG_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+```
+
+# Ensure first = last
+```{r}
+
+dplyr::count(B1_Animals %>% filter(Since_first_conversion == 0), Since_last_conversion) # 42 outliers
+dplyr::count(B1_Animals %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+
+dplyr::count(B2_Plants %>% filter(Since_first_conversion == 0), Since_last_conversion) # 0
+dplyr::count(B2_Plants %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+
+dplyr::count(B3_Fungi %>% filter(Since_first_conversion == 0), Since_last_conversion) # 0
+dplyr::count(B3_Fungi %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+# This happens because the Since_first_conversion detects a drop below 0.7 at the year 2015 (where 2015-2015 =0), while Since_last_conversion above 0.7 at 2014 (2015-2014 = 1). This contradicts the reading, so it is removed!
+
+###### Fixing the B1_Animals! ######
+B1_Animals <- B1_Animals %>% filter(!(Since_first_conversion == 0 & Since_last_conversion == 1))
+
+B1_Carnivore <- B1_Animals %>% filter(FG == "Carnivore")
+B1_Herbivore <- B1_Animals %>% filter(FG == "Herbivore")
+B1_Omnivore <- B1_Animals %>% filter(FG == "Omnivore")
+
+B2_C <- B2_Plants %>% filter(FG == "C")
+B2_S <- B2_Plants %>% filter(FG == "S")
+B2_R <- B2_Plants %>% filter(FG == "R")
+
+B3_Sapro <- B3_Fungi %>% filter(FG == "Saprotroph")
+B3_Sym <- B3_Fungi %>% filter(FG == "Symbiotroph")
+B3_Path <- B3_Fungi %>% filter(FG == "Pathotroph")
+
+
+```
+
+
+
+# Scaling:
+1. Filter out empty rows in Since first and Since last conversion
+2. Converting to integer (since I am using species richness, this step may not be necessary in this study, but may be useful in the future)
+3. Merging land use and intensity as "Land_use_intensity"
+
+PLEASE NOTE THAT: "Land_use_intensity" used in the following script is the same as "Land use type and intensity (LUTI)" used in the main study. It was later redefined in the main study to avoid confusion with land intensity (which describes how intensively used a land is!)
+```{r}
+Ezscale <- function(DF) {
+  A <- DF %>% filter(!is.na(Since_first_conversion)) %>% filter(!is.na(Since_last_conversion))
+  B <- A %>%  mutate(Years_since_PREDICTS_scaled = scale(Years_since_fragmentation_or_conversion),
+                     Years_since_PREDICTS_log = log(Years_since_fragmentation_or_conversion + 1),
+                     Since_first_conversion_scaled = scale(Since_first_conversion),
+                     Since_first_conversion_log = log(Since_first_conversion + 1),
+                     Since_last_conversion_scaled = scale(Since_last_conversion),
+                     Since_last_conversion_log = log(Since_last_conversion + 1)) %>% 
+    relocate(Years_since_PREDICTS_scaled, Years_since_PREDICTS_log, .after = Years_since_fragmentation_or_conversion) %>% 
+    relocate(Since_first_conversion_scaled, Since_first_conversion_log, .after = Since_first_conversion) %>% 
+    relocate(Since_last_conversion_scaled, Since_last_conversion_log,.after = Since_last_conversion)
+  C <- B %>% mutate(Total_abundance_integer = round(Total_abundance, 0),
+              Simpson_diversity_integer = round(Simpson_diversity, 0),
+              ChaoR_integer = round(ChaoR),
+              Richness_rarefied_integer = round(Richness_rarefied, 0))
+  D <- C %>% mutate(Evenness = ((Simpson_diversity/Species_richness))) 
+  
+  ################################################# IGNORE below, not used this study #################################################
+  E <- D %>% 
+    mutate(Years_since_first = ifelse(Since_first_conversion == 0, "Never", 
+                                               ifelse(Since_first_conversion >0 & Since_first_conversion <= 200, "0~200",
+                                                      ifelse(Since_first_conversion > 200 & Since_first_conversion <= 400, "200~400",
+                                                             ifelse(Since_first_conversion > 400 & Since_first_conversion <= 600, "400~600",
+                                                                    ifelse(Since_first_conversion > 600 & Since_first_conversion <= 800, "600~800",
+                                                                           ifelse(Since_first_conversion > 800 & Since_first_conversion <= 1000, "800~1000",
+                                                                                  ifelse(Since_first_conversion > 1000 & Since_first_conversion < 1165, "1000~1165",
+                                                                                         ifelse(Since_first_conversion == 1165, "Always", "NA"))))))))) %>% 
+    mutate(Years_since_last = ifelse(Since_last_conversion == 0, "Never", 
+                                               ifelse(Since_last_conversion >0 & Since_last_conversion <= 200, "0~200",
+                                                      ifelse(Since_last_conversion > 200 & Since_last_conversion <= 400, "200~400",
+                                                             ifelse(Since_last_conversion > 400 & Since_last_conversion <= 600, "400~600",
+                                                                    ifelse(Since_last_conversion > 600 & Since_last_conversion <= 800, "600~800",
+                                                                           ifelse(Since_last_conversion > 800 & Since_last_conversion <= 1000, "800~1000",
+                                                                                  ifelse(Since_last_conversion > 1000 & Since_last_conversion < 1165, "1000~1165",
+                                                                                         ifelse(Since_last_conversion == 1165, "Always", "NA")))))))))
+  ################################################# IGNORE above, not used this study ################################################# 
+  E <- E %>% relocate(Years_since_first, .after = Since_first_conversion_scaled) %>% relocate(Years_since_last, .after = Since_last_conversion_scaled)
+  E$Intensity_abbreviation <- dplyr::recode(E$Intensity, 
+                                            "Minimal" = "Min",
+                                            "Light" = "Int",
+                                            "Intense" = "Max") 
+  E <- E %>% relocate(Intensity_abbreviation, .after = Intensity)
+  E$Land_use_brief <- dplyr::recode(E$Land_use,
+                                    "PV" = "PV",
+                                    "SV" = "SV",
+                                    "Plantation" = "AG",
+                                    "Pasture" = "AG",
+                                    "Crop" = "AG",
+                                    "Urban" = "Urban")
+  E <- E %>% unite(LUI, c(Land_use_brief, Intensity_abbreviation))
+  E$Land_use_intensity <- dplyr::recode(E$LUI, 
+                                        "PV_Min" = "A_PV",
+                                        "PV_Int" = "A_PV",
+                                        "PV_Max" = "A_PV",
+                                        "SV_Min" = "B_SV",
+                                        "SV_Int" = "B_SV",
+                                        "SV_Max" = "B_SV",
+                                        "AG_Min" = "C1_AG_Min",
+                                        "AG_Int" = "C2_AG_Int",
+                                        "AG_Max" = "C3_AG_Max",
+                                        "Urban_Min" = "D1_Urban_Min",
+                                        "Urban_Int" = "D2_Urban_Int",
+                                        "Urban_Max"= "D3_Urban_Max")
+  E
+} 
+
+####### Scaling #########
+B1_Carnivore <- Ezscale(B1_Carnivore)
+B1_Herbivore <- Ezscale(B1_Herbivore)
+B1_Omnivore <- Ezscale(B1_Omnivore)
+
+B2_C <- Ezscale(B2_C)
+B2_S <- Ezscale(B2_S)
+B2_R <- Ezscale(B2_R)
+
+B3_Sapro <- Ezscale(B3_Sapro)
+B3_Sym <- Ezscale(B3_Sym)
+B3_Path <- Ezscale(B3_Path)
+
+#### checking ####
+# Yes, scaling is by (value - mean)/SD
+mean(B1_Carnivore$Since_last_conversion, na.rm = TRUE) # 214.3821
+sd(B1_Carnivore$Since_last_conversion, na.rm = TRUE) # 381.0042
+
+dplyr::count(B2_S, Land_use_intensity) # No NAs, good!
+```
+
+# SpatialAutocorrelation 
+1. Run these to ensure SSs are all unique 
+```{r}
+####### Run this for the SpatialAutocorrelation test to work" #########
+B1_Carnivore$SS <- factor(B1_Carnivore$SS, levels = unique(B1_Carnivore$SS)) 
+B1_Herbivore$SS <- factor(B1_Herbivore$SS, levels = unique(B1_Herbivore$SS))
+B1_Omnivore$SS <- factor(B1_Omnivore$SS, levels = unique(B1_Omnivore$SS))
+
+B2_C$SS <- factor(B2_C$SS, levels = unique(B2_C$SS))
+B2_S$SS <- factor(B2_S$SS, levels = unique(B2_S$SS))
+B2_R$SS <- factor(B2_R$SS, levels = unique(B2_R$SS))
+
+B3_Sapro$SS <- factor(B3_Sapro$SS, levels = unique(B3_Sapro$SS))
+B3_Sym$SS <- factor(B3_Sym$SS, levels = unique(B3_Sym$SS))
+B3_Path$SS <- factor(B3_Path$SS, levels = unique(B3_Path$SS))
+
+##### Checking #####
+all(levels(B1_Carnivore$SS) == unique(B1_Carnivore$SS)) # TRUE
+all(levels(B1_Herbivore$SS) == unique(B1_Herbivore$SS)) # TRUE
+all(levels(B1_Omnivore$SS) == unique(B1_Omnivore$SS)) # TRUE
+
+all(levels(B2_C$SS) == unique(B2_C$SS)) # TRUE
+all(levels(B2_S$SS) == unique(B2_S$SS)) # TRUE
+all(levels(B2_R$SS) == unique(B2_R$SS)) # TRUE
+
+all(levels(B3_Sapro$SS) == unique(B3_Sapro$SS)) # TRUE
+all(levels(B3_Sym$SS) == unique(B3_Sym$SS)) # TRUE
+all(levels(B3_Path$SS) == unique(B3_Path$SS)) # TRUE
+
+```
+
+# Functions:
+##  glmmer
+```{r}
+
+############################ AIC weight ###########################
+EzAICweight <- function(modelAIC) {
+  A <- modelAIC
+  
+  B <- data.frame(deltaAIC = akaike.weights(A$Difference)$deltaAIC ,
+                  Relative_likelihood = akaike.weights(A$Difference)$rel.LL,
+                  Weights = akaike.weights(A$Difference)$weights)
+  C <- A %>% cbind(B)
+  C
+}
+
+############################################################### Function for 8 models ##############################################################
+Ezmodel <- function(DF, expvar, FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8, RE, max){
+  
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  A0 <- StatisticalModels::GLMEROverdispersion(model = A$model)
+  A1 <- R2GLMER(A$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = A0$P.ChiSq)
+  
+  B <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE2,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  B0 <- StatisticalModels::GLMEROverdispersion(model = B$model)
+  B1 <- R2GLMER(B$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = B0$P.ChiSq)
+  
+  C <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE3,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  C0 <- StatisticalModels::GLMEROverdispersion(model = C$model)
+  C1 <- R2GLMER(C$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = C0$P.ChiSq)
+  
+  D <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE4,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  D0 <- StatisticalModels::GLMEROverdispersion(model = D$model)
+  D1 <- R2GLMER(D$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = D0$P.ChiSq)
+  
+  E <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE5,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  E0 <- StatisticalModels::GLMEROverdispersion(model = E$model)
+  E1 <- R2GLMER(E$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = E0$P.ChiSq)
+  
+  FF <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE6,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                 maxIters = max)
+  F0 <- StatisticalModels::GLMEROverdispersion(model = FF$model)
+  F1 <- R2GLMER(FF$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                         "Overdisp" = F0$P.ChiSq)
+
+  G <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE7,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  G0 <- StatisticalModels::GLMEROverdispersion(model = G$model)
+  G1 <- R2GLMER(G$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = G0$P.ChiSq)
+  
+  H <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE8,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  H0 <- StatisticalModels::GLMEROverdispersion(model = H$model)
+  H1 <- R2GLMER(H$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = H0$P.ChiSq)
+  
+  R2 <- rbind(A1, B1, C1, D1, E1, F1, G1, H1)
+  
+  AIC1 <- AIC(A$model, B$model, C$model, D$model, E$model, FF$model, G$model, H$model)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Fixed_effect = c(FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8)) %>% relocate(Fixed_effect) %>% cbind(R2)  %>% mutate(Explanatory_variable = expvar) %>% mutate(Random_effect = RE) %>% relocate(Random_effect, .after = Fixed_effect)
+  
+  AIC2 <- EzAICweight(AIC2) %>% mutate(Weights_rounded = round(Weights, 10))
+  AIC2
+}
+```
+
+##  Negative binomial
+```{r}
+################################################### Function for 8 negative binomial models ###########################################################
+Ezmodelnb <- function(df, Term1, Term2, Term3, Term4, Term5, Term6, Term7, Term8, opt, iter) {
+  A <- glmer.nb(noquote(Term1),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  A0 <- StatisticalModels::GLMEROverdispersion(model = A)
+  A1 <- R2GLMER(A) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = A0$P.ChiSq)
+
+  B <- glmer.nb(noquote(Term2),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  B0 <- StatisticalModels::GLMEROverdispersion(model = B)
+  B1 <- R2GLMER(B) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = B0$P.ChiSq)    
+
+  C <- glmer.nb(noquote(Term3),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  C0 <- StatisticalModels::GLMEROverdispersion(model = C)
+  C1 <- R2GLMER(C) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = C0$P.ChiSq)
+  
+  D <- glmer.nb(noquote(Term4),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  D0 <- StatisticalModels::GLMEROverdispersion(model = D)
+  D1 <- R2GLMER(D) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = D0$P.ChiSq)  
+
+  E <- glmer.nb(noquote(Term5),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  E0 <- StatisticalModels::GLMEROverdispersion(model = E)
+  E1 <- R2GLMER(E) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = E0$P.ChiSq)  
+
+  FF <- glmer.nb(noquote(Term6),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  F0 <- StatisticalModels::GLMEROverdispersion(model = FF)
+  F1 <- R2GLMER(FF) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                   "Overdisp" = F0$P.ChiSq)
+
+  G <- glmer.nb(noquote(Term7),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  G0 <- StatisticalModels::GLMEROverdispersion(model = G)
+  G1 <- R2GLMER(G) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = G0$P.ChiSq)
+
+  H <- glmer.nb(noquote(Term8),
+                data = df,
+                nb.control = glmerControl(optimizer = opt,
+                optCtrl = list(maxfun = iter)))
+  H0 <- StatisticalModels::GLMEROverdispersion(model = H)
+  H1 <- R2GLMER(H) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                  "Overdisp" = H0$P.ChiSq)  
+  
+  R2 <- rbind(A1, B1, C1, D1, E1, F1, G1, H1)
+
+  AIC1 <- AIC(A, B, C, D, E, FF, G, H)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Fixed_effect = c(Term1, Term2, Term3, Term4, Term5, Term6, Term7, Term8)) %>% relocate(Fixed_effect) %>% cbind(R2)
+  AIC2 <- EzAICweight(AIC2) %>% mutate(Weights_rounded = round(Weights, 10))
+  AIC2    
+}
+```
+
+##  Q-Poisson
+```{r}
+################################################### Function for 1 Quasi-Poisson model ###########################################################
+EzmodelQuasi <- function(df, Term1, opt, iter) {
+  A <-  MASS::glmmPQL(
+    data = df,
+    fixed =  noquote(Term1),
+    random = list(SS = ~1, SSB = ~1),
+    family = quasipoisson,
+    control = lmeControl(maxIter = iter ,optimMethod = opt))
+}
+
+T1 <- EzmodelQuasi(B1_Omnivore, 
+                   "Species_richness ~ Land_use_intensity + Since_first_conversion_log",
+                   20000,
+                   "Nelder-Mead")
+
+
+T1 <- MASS::glmmPQL(Species_richness ~ Land_use_intensity + Since_first_conversion_log, 
+                    random = list(SS = ~1, SSB = ~1),
+                    family = quasipoisson,
+                    control = lmeControl(maxIter = 10000, optimMethod = "Nelder-Mead"),
+                    data = B1_Omnivore)
+summary(T1)
+simulateResiduals(T1)
+plot(T1)
+```
+
+##  Spatial autocorrelation test
+```{r}
+###################### Spatial Autocorrelation function ######################
+EzSpatialcheck <- function(md, name) {
+
+  # Extracting the number of SS in the model  
+  A <- summary(md$model)
+  B <- A$ngrps %>% as.data.frame() %>% tibble::rownames_to_column("RE") %>% filter(RE == "SS") %>% rename("n" = ".") %>% select(n) %>% as.numeric()
+
+  #Plotting the histogram to check for spatial autocorrelation
+  sat <- StatisticalModels::SpatialAutocorrelationTest(md,ranefGrouping = "SS")
+  sat2 <- sat$P %>% as.data.frame() %>% rename("P" = ".")
+  ggplot(data = sat2, aes(x = P)) + geom_histogram(aes(y = ..density..), breaks = c(0,0.05, 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1), fill = "grey", col = "black") + geom_vline(xintercept = 0.05, col = "red") + 
+  labs(title = name, subtitle = paste("Number of SS =", B), x = "P-value", y = "Density") + 
+  theme_classic() +
+  theme(text = element_text(size=16),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+    
+}
+# Testing #
+EzSpatialcheck(AS1_Last_YSC_biome, "Test")
+
+```
+
+# 0. Exploring
+```{r, fig.width=15, fig.height=5}
+######### Exploring 
+ggarrange(ggplot(data = B1_Carnivore, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Car"),
+          ggplot(data = B1_Herbivore, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Herb"),
+          ggplot(data = B1_Omnivore, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Om"), ncol = 3, nrow = 1)
+
+ggarrange(ggplot(data = B2_C, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "C"),
+          ggplot(data = B2_S, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "S"),
+          ggplot(data = B2_R, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "R"), ncol = 3, nrow = 1)
+
+ggarrange(ggplot(data = B3_Sym, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Sym"),
+          ggplot(data = B3_Sapro, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Sapro"),
+          ggplot(data = B3_Path, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Path"), ncol = 3, nrow = 1)
+```
+
+# 1. Model AIC selection
+## 1.1 Car, Herb, Om
+```{r}
+B1_AIC_Carnivore_Final <- Ezmodel(B1_Carnivore,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)",
+        20000)
+
+# Failed to converge
+B1_AIC_Herbivore_Final <- Ezmodel(B1_Herbivore,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)",
+        20000)
+
+# Fail to converge, theta iteration reached
+B1_AIC_Omnivore_Final_nb <- Ezmodelnb(B1_Omnivore,
+                                         "Species_richness~Land_use_intensity*Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity*Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                         "Species_richness~1 + (1|SS) + (1|SSB)",
+                                         "bobyqa",
+                                         20000)
+
+# No problem when run with SS and SSB, but issingular when with SS and SSBS
+B1_AIC_Omnivore_Final <- Ezmodel(B1_Omnivore,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)",
+        20000)
+
+```
+
+## 1.2. C, S, R
+```{r}
+B2_AIC_C_Final <- Ezmodel(B2_C,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSBS)",
+        20000)
+
+B2_AIC_R_Final <- Ezmodel(B2_R,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)",
+        20000)
+
+B2_AIC_S_Final_nb <- Ezmodelnb(B2_S,
+                                         "Species_richness~Land_use_intensity*Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity*Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                         "Species_richness~1 + (1|SS) + (1|SSB)",
+                                         "bobyqa",
+                                         20000)
+
+B2_AIC_S_Final <- Ezmodel(B2_S,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)",
+        20000)
+
+
+B2_AIC_C_Final_weight <- EzAICweight(B2_AIC_C_Final) 
+B2_AIC_S_Final_weight <- EzAICweight(B2_AIC_S_Final_nb)
+B2_AIC_R_Final_nb_weight <- EzAICweight(B2_AIC_R_Final)
+
+######### Exploring 
+ggarrange(ggplot(data = B2_C, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "C"),
+          ggplot(data = B2_S, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "S"),
+          ggplot(data = B2_R, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "R"))
+```
+
+
+
+
+## 1.3. Sym, Sapro, Path
+```{r}
+B3_AIC_Sym_Final <- Ezmodel(B3_Sym,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSBS)",
+        20000)
+
+B3_AIC_Sym_Final_nb <- Ezmodelnb(B3_Sym,
+                                         "Species_richness~Land_use_intensity*Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity*Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                         "Species_richness~1 + (1|SS) + (1|SSB)",
+                                         "bobyqa",
+                                         20000)
+
+
+B3_AIC_Sapro_Final <- Ezmodel(B3_Sapro,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSBS)",
+        20000)
+
+B3_AIC_Sapro_Final_nb <- Ezmodelnb(B3_Sapro,
+                                         "Species_richness~Land_use_intensity*Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity*Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                         "Species_richness~1 + (1|SS) + (1|SSB)",
+                                         "bobyqa",
+                                         20000)
+
+B3_AIC_Path_Final_nb <- Ezmodelnb(B3_Path,
+                                         "Species_richness~Land_use_intensity*Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity*Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity+Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_first_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                         "Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                         "Species_richness~1 + (1|SS) + (1|SSB)",
+                                         "bobyqa",
+                                         20000)
+
+B3_AIC_Path_Final <- Ezmodel(B3_Path,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)",
+        20000)
+
+######### Exploring 
+ggarrange(ggplot(data = B3_Sym, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Sym"),
+          ggplot(data = B3_Sapro, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Sapro"),
+          ggplot(data = B3_Path, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic() + labs(title = "Path"))
+```
+
+# 2. Best YSC models
+## 2.1. Car: LUI + Last
+```{r}
+########################### Carnivore ###########################
+
+BS1_Carnivore_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B1_Carnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS1_Carnivore_first_YSC_LUI <- StatisticalModels::GLMER(modelData = B1_Carnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_first_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS1_Carnivore_last_YSC <- StatisticalModels::GLMER(modelData = B1_Carnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+#### validation ####
+summary(BS1_Carnivore_last_YSC_LUI$model)
+summary(BS1_Carnivore_last_YSC$model)
+
+plot(simulateResiduals(BS1_Carnivore_last_YSC_LUI$model))
+plot(simulateResiduals(BS1_Carnivore_last_YSC$model))
+plot(simulateResiduals(BS1_Carnivore_first_YSC_LUI$model))
+
+EzSpatialcheck(BS1_Carnivore_last_YSC, "Carnivore:YSC")
+T1 <- StatisticalModels::GLMEROverdispersion(model = BS1_Carnivore_last_YSC$model)
+StatisticalModels::GLMEROverdispersion(model = BS1_Carnivore_last_YSC_LUI$model)
+
+T1$P.ChiSq
+
+plot(BS1_Carnivore_last_YSC$model)
+
+testDispersion(BS1_Carnivore_last_YSC$model, type = "DHARMa")
+testOutliers(BS1_Carnivore_last_YSC$model, type = 'bootstrap') # p = 0.16, no outliers! Note that outlier in DHARma is defined differently!
+testZeroInflation(BS1_Carnivore_last_YSC$model) # ratioObsSim = 1.5742
+
+ggplot(data = B1_Carnivore, aes(x = Since_last_conversion_log)) + geom_histogram(aes(y = ..count..), bin = 30) + theme_classic()
+```
+
+
+
+
+## 2.2. Herb: Last + LUI
+```{r}
+BS1_Herbivore_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B1_Herbivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS1_Herbivore_last_YSC <- StatisticalModels::GLMER(modelData = B1_Herbivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+#### validation ####
+summary(BS1_Herbivore_last_YSC_LUI$model)
+summary(BS1_Herbivore_last_YSC$model)
+
+plot(simulateResiduals(BS1_Herbivore_last_YSC_LUI$model))
+plot(simulateResiduals(BS1_Herbivore_last_YSC$model))
+
+EzSpatialcheck(BS1_Herbivore_last_YSC, "Herbivore: YSC")
+StatisticalModels::GLMEROverdispersion(model = BS1_Herbivore_last_YSC$model)
+
+plot(BS1_Herbivore_last_YSC$model)
+
+testDispersion(BS1_Herbivore_last_YSC$model, type = "DHARMa")
+testOutliers(BS1_Herbivore_last_YSC$model, type = 'bootstrap') # Fewer outlier than expected, underdispersion
+testZeroInflation(BS1_Herbivore_last_YSC$model)
+```
+
+## 2.3. Om: Last
+```{r}
+################## BEST: Omnivore and log() ##################
+
+BS1_Omnivore_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity*Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS1_Omnivore_last_YSC_LUI_test <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS1_Omnivore_last_YSC <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+################## Omnivore and raw ##################
+BS1_Omnivore_last_YSC_raw <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+################## Omnivore and scale() ##################
+BS1_Omnivore_last_YSC_rescaled <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_scaled",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+################## Omnivore and log+scale() ##################
+BS1_Omnivore_last_YSC_scaled <- StatisticalModels::GLMER(modelData = B1_Omnivore %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log)),
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log_scaled",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+################## Omnivore and NB ##################
+BS1_Omnivore_last_YSC_nb <- glmer.nb("Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                  data = B1_Omnivore,
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+################## Omnivore and zero inflation ##################
+BS1_Omnivore_last_YSC_Zero <- glmmTMB::glmmTMB(Species_richness ~ Since_last_conversion_log_scaled + (1|SS)+(1|SSB), 
+                                            data = (B1_Omnivore %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log))),
+                                            ziformula= ~ Since_last_conversion_log_scaled,
+                                            family = nbinom2)
+
+#### validation ####
+summary(BS1_Omnivore_last_YSC_LUI$model)
+summary(BS1_Omnivore_last_YSC$model)
+
+summary(BS1_Omnivore_last_YSC_nb)
+summary(BS1_Omnivore_last_YSC_Zero)
+
+AIC(BS1_Omnivore_last_YSC$model, BS1_Omnivore_last_YSC_nb, BS1_Omnivore_last_YSC_Zero, BS1_Omnivore_last_YSC_scaled$model)
+
+plot(BS1_Omnivore_last_YSC$model)
+plot(BS1_Omnivore_last_YSC_rescaled$model)
+plot(BS1_Omnivore_last_YSC_scaled$model)
+plot(BS1_Omnivore_last_YSC_raw$model)
+
+
+plot(simulateResiduals(BS1_Omnivore_last_YSC$model))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_nb))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_Zero))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_scaled$model))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_rescaled$model))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_raw$model))
+plot(simulateResiduals(BS1_Omnivore_last_YSC_LUI$model))
+
+lrtest(BS1_Omnivore_last_YSC$model, BS1_Omnivore_last_YSC_nb)
+
+EzSpatialcheck(BS1_Omnivore_last_YSC_LUI, "Omnivore: YSC LUI")
+
+StatisticalModels::GLMEROverdispersion(model = BS1_Omnivore_last_YSC_LUI$model) # No overdisperison
+testOutliers(BS1_Omnivore_last_YSC_LUI$model, type = 'bootstrap') # p-value = 0.16, not too many or few outliers
+
+### testing ###
+count(B1_Omnivore, SSB)
+```
+
+
+## 2.4. C: Last
+```{r}
+BS2_C_last_YSC <- StatisticalModels::GLMER(modelData = B2_C,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_C_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B2_C,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS2_C_last_YSC_LUI$model)
+summary(BS2_C_last_YSC$model)
+
+  plot(simulateResiduals(BS2_C_last_YSC$model))
+plot(simulateResiduals(BS2_C_last_YSC_LUI$model))
+
+EzSpatialcheck(BS2_C_last_YSC_LUI, "C: YSC LUI")
+StatisticalModels::GLMEROverdispersion(model = BS2_C_last_YSC_LUI$model)
+```
+## 2.5. S: LUI + First
+```{r}
+BS2_S_first_YSC_LUI <- StatisticalModels::GLMER(modelData = B2_S,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_first_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_S_first_YSC <- StatisticalModels::GLMER(modelData = B2_S,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_first_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS2_S_first_YSC_LUI$model)
+summary(BS2_S_first_YSC$model)
+
+plot(simulateResiduals(BS2_S_first_YSC_LUI$model))
+plot(simulateResiduals(BS2_S_first_YSC$model))
+
+EzSpatialcheck(BS2_S_first_YSC, "S: YSC")
+StatisticalModels::GLMEROverdispersion(model = BS2_S_first_YSC$model)
+```
+
+
+## 2.6. R: Last
+```{r}
+
+BS2_R_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B2_R,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_R_last_YSC <- StatisticalModels::GLMER(modelData = B2_R,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_R_last_YSC_zero <- glmmTMB::glmmTMB(Species_richness ~ Since_last_conversion_log + (1|SS)+(1|SSB)+(1|SSBS), 
+                                            data = (B2_R),
+                                            ziformula= ~ Since_last_conversion_log,
+                                            family = poisson)
+
+BS2_R_last_YSC_scaled <- StatisticalModels::GLMER(modelData = B2_R %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log)),
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log_scaled",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_R_last_YSC_rescaled <- StatisticalModels::GLMER(modelData = B2_R,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_scaled",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS2_R_last_YSC_raw <- StatisticalModels::GLMER(modelData = B2_R,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS2_R_last_YSC_LUI$model)
+summary(BS2_R_last_YSC$model)
+
+plot(simulateResiduals(BS2_R_last_YSC$model))
+plot(simulateResiduals(BS2_R_last_YSC_scaled$model))
+plot(simulateResiduals(BS2_R_last_YSC_rescaled$model))
+plot(simulateResiduals(BS2_R_last_YSC_raw$model))
+plot(simulateResiduals(BS2_R_last_YSC_LUI$model))
+plot(simulateResiduals(BS2_R_last_YSC_zero))
+
+
+plot(BS2_R_last_YSC$model)
+
+AIC(BS2_R_last_YSC$model, BS2_R_last_YSC_raw$model, BS2_R_last_YSC_rescaled$model, BS2_R_last_YSC_scaled$model)
+
+EzSpatialcheck(BS2_R_last_YSC_LUI, "R: YSCc LUI")
+StatisticalModels::GLMEROverdispersion(model = BS2_R_last_YSC_LUI$model)
+testOutliers(BS2_R_last_YSC$model) # No outliers
+
+```
+
+## 2.7. Sym: Last
+```{r}
+
+BS3_Sym_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B3_Sym,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS3_Sym_last_YSC <- StatisticalModels::GLMER(modelData = B3_Sym,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS3_Sym_last_YSC_nb <- glmer.nb("Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB)",
+                                  data = B3_Sym,
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+BS3_Sym_last_YSC_nb_scale <- glmer.nb("Species_richness~Since_last_conversion_scaled + (1|SS) + (1|SSB)",
+                                  data = B3_Sym,
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+BS3_Sym_last_YSC_nb_log_scale <- glmer.nb("Species_richness~Since_last_conversion_log_scaled + (1|SS) + (1|SSB)",
+                                  data = B3_Sym %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log)),
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+BS3_Sym_last_YSC_Zero <- glmmTMB::glmmTMB(Species_richness ~ Since_last_conversion_log + (1|SS)+(1|SSB), 
+                                            data = (B3_Sym),
+                                            ziformula= ~ Since_last_conversion_log,
+                                            family = poisson)
+
+
+summary(BS3_Sym_last_YSC_LUI$model)
+summary(BS3_Sym_last_YSC_nb)
+
+plot(simulateResiduals(BS3_Sym_last_YSC_LUI$model))
+plot(simulateResiduals(BS3_Sym_last_YSC_Zero, 1000))
+plot(simulateResiduals(BS3_Sym_last_YSC_nb)) # Best one
+plot(simulateResiduals(BS3_Sym_last_YSC_nb_scale))
+plot(simulateResiduals(BS3_Sym_last_YSC_nb_log_scale))
+plot(simulateResiduals(BS3_Sym_last_YSC_Zero))
+plot(simulateResiduals(BS3_Sym_LUI$model))
+
+plot(BS3_Sym_last_YSC$model)
+
+AIC(BS3_Sym_last_YSC$model, BS3_Sym_last_YSC_Zero, BS3_Sym_last_YSC_nb, BS3_Sym_last_YSC_nb_log_scale, BS3_Sym_last_YSC_nb_scale)
+
+EzSpatialcheck(BS3_Sym_LUI, "Sym: LUI")
+
+StatisticalModels::GLMEROverdispersion(model = BS3_Sym_LUI$model)
+
+testOutliers(BS3_Sym_last_YSC_nb) # none
+
+### Testing ###
+ggplot(data = B3_Sym, aes(x = Since_last_conversion_log)) + geom_histogram(stat = "count") + theme_classic()
+```
+
+## 2.8. Sapro: ???
+```{r}
+########## YSC and LUI ##########
+BS3_Sapro_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B3_Sapro,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS3_Sapro_last_YSC_LUI_scaled <- StatisticalModels::GLMER(modelData = B3_Sapro %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log)),
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log_scaled",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS3_Sapro_last_YSC_LUI_zero <- glmmTMB::glmmTMB(Species_richness ~ Land_use_intensity+Since_last_conversion_log + (1|SS)+(1|SSB), 
+                                            data = (B3_Sapro),
+                                            ziformula= ~ Since_last_conversion_log,
+                                            family = nbinom2)
+
+########## YSC ##########
+BS3_Sapro_last_YSC <- StatisticalModels::GLMER(modelData = B3_Sapro ,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+BS3_Sapro_last_YSC_Zero <- glmmTMB::glmmTMB(Species_richness ~ Since_last_conversion_log_scaled + (1|SS)+(1|SSB), 
+                                            data = (B3_Sapro %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log))),
+                                            ziformula= ~ Since_last_conversion_log_scaled,
+                                            family = poisson)
+
+BS3_Sapro_last_YSC_nb <- glmer.nb(Species_richness~Since_last_conversion_log + (1|SS) + (1|SSB),
+                data = B3_Sapro,
+                nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 20000)))
+
+########## LUI ##########
+
+
+summary(BS3_Sapro_last_YSC_LUI$model)
+summary(BS3_Sapro_last_YSC_Zero)
+summary(BS3_Sapro_last_YSC_LUI$model)
+
+# YSC and LUI
+plot(simulateResiduals(BS3_Sapro_last_YSC_LUI$model))
+
+# YSC
+plot(simulateResiduals(BS3_Sapro_last_YSC$model))
+plot(simulateResiduals(BS3_Sapro_last_YSC_Zero))
+plot(simulateResiduals(BS3_Sapro_last_YSC_nb))
+
+
+EzSpatialcheck(BS3_Sapro_LUI, "Sapro: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS3_Sapro_last_YSC_Zero)
+
+testZeroInflation(BS3_Sapro_last_YSC$model)
+testZeroInflation(BS3_Sapro_last_YSC_Zero)
+StatisticalModels::GLMEROverdispersion(model = BS3_Sapro_LUI$model) # Nope
+
+BS3_Sapro_last_YSC_Zero$fitted
+
+  ### test ###
+ggplot(data = B3_Sapro, aes(x = Since_last_conversion_log)) + geom_histogram(stat = "count") + theme_classic()
+```
+
+## 2.9. Path: Last
+```{r}
+
+BS3_Path_last_YSC_LUI <- StatisticalModels::GLMER(modelData = B3_Path,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 40000,
+                                     optimizer="Nelder_Mead")
+
+BS3_Path_last_YSC_LUI1 <- StatisticalModels::GLMER(modelData = B3_Path,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 40000,
+                                     optimizer="bobyqa")
+
+BS3_Path_last_YSC <- StatisticalModels::GLMER(modelData = B3_Path,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS3_Path_last_YSC_LUI$model)
+summary(BS3_Path_last_YSC$model)
+
+plot(simulateResiduals(BS3_Path_last_YSC_LUI$model))
+plot(simulateResiduals(BS3_Path_last_YSC$model))
+
+EzSpatialcheck(BS3_Path_last_YSC_LUI, "Path: YSC LUI")
+StatisticalModels::GLMEROverdispersion(model = BS3_Path_LUI$model)
+```
+
+
+# 3. Best LUI:
+## 3.1. Car: LUI
+```{r}
+BS1_Carnivore_LUI <- StatisticalModels::GLMER(modelData = B1_Carnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+summary(BS1_Carnivore_LUI$model)
+plot(simulateResiduals(BS1_Carnivore_LUI$model))
+EzSpatialcheck(BS1_Carnivore_LUI, "Carnivore: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS1_Carnivore_LUI$model)
+```
+## 3.2. Herb: LUI
+```{r}
+BS1_Herbivore_LUI <- StatisticalModels::GLMER(modelData = B1_Herbivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS1_Herbivore_LUI$model)
+plot(simulateResiduals(BS1_Herbivore_LUI$model))
+EzSpatialcheck(BS1_Herbivore_LUI, "Herbivore: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS1_Herbivore_LUI$model)
+```
+
+## 3.3. Om: LUI
+```{r}
+BS1_Omnivore_LUI <- StatisticalModels::GLMER(modelData = B1_Omnivore,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+plot(simulateResiduals(BS1_Omnivore_LUI$model))
+summary(BS1_Omnivore_LUI$model)
+StatisticalModels::GLMEROverdispersion(model = BS1_Omnivore_LUI$model)
+```
+
+
+## 3.4. C: LUI
+```{r}
+BS2_C_LUI <- StatisticalModels::GLMER(modelData = B2_C,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS2_C_LUI$model)
+plot(simulateResiduals(BS2_C_LUI$model))
+EzSpatialcheck(BS2_C_LUI, "C: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS2_C_LUI$model)
+
+summary(BS2_C_LUI$model)
+```
+## 3.5. S: LUI
+```{r}
+BS2_S_LUI <- StatisticalModels::GLMER(modelData = B2_S,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+summary(BS2_S_LUI$model)
+
+    plot(simulateResiduals(BS2_S_LUI$modl))
+EzSpatialcheck(BS2_S_LUI, "S: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS2_S_LUI$model)
+```
+
+
+
+## 3.6. R: LUI close
+```{r}
+BS2_R_LUI <- StatisticalModels::GLMER(modelData = B2_R,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+summary(BS2_R_LUI$model)
+
+plot(simulateResiduals(BS2_R_LUI$model))
+EzSpatialcheck(BS2_R_LUI, "R: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS2_R_LUI$model)
+```
+
+## 3.7. Sym: LUI
+```{r}
+# LUI
+BS3_Sym_LUI <- StatisticalModels::GLMER(modelData = B3_Sym,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+summary(BS3_Sym_LUI$model)
+
+plot(simulateResiduals(BS3_Sym_LUI$model))
+EzSpatialcheck(BS3_Sym_LUI, "Sym: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS3_Sym_LUI$model)
+```
+
+## 3.8. Sapro: LUI
+```{r}
+BS3_Sapro_LUI <- StatisticalModels::GLMER(modelData = B3_Sapro,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(BS3_Sapro_LUI$model)
+plot(simulateResiduals(BS3_Sapro_LUI$model))
+summary(BS3_Sapro_LUI$model)
+EzSpatialcheck(BS3_Sapro_LUI, "Sapro: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS3_Sapro_LUI$model)
+
+
+```
+
+## 3.9. Path: LUI
+```{r}
+# Issingular
+BS3_Path_LUI <- StatisticalModels::GLMER(modelData = B3_Path,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000,
+                                     optimizer = "Nelder_Mead")
+
+BS3_Path_LUI_Zero <- glmmTMB::glmmTMB(Species_richness ~ Land_use_intensity + (1|SS)+(1|SSB), 
+                                            data = (B3_Path),
+                                            family = poisson)
+
+# issingular + failed to converge
+BS3_Path_LUI_nb <- glmer.nb("Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                  data = B3_Path,
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+summary(BS3_Path_LUI$model)
+
+AIC(BS3_Path_LUI$model, BS3_Path_LUI_Zero, BS3_Path_LUI_nb)
+
+plot(simulateResiduals(BS3_Path_LUI$model))
+plot(simulateResiduals(BS3_Path_LUI_Zero))
+
+EzSpatialcheck(BS3_Path_YSC_LUI, "Path: LUI")
+StatisticalModels::GLMEROverdispersion(model = BS3_Path_LUI$model)
+```
+## 3.10 ALL DHARma and overdispersion 
+```{r, fig.width=10}
+##################################### Function with DHARma and Statisticalmodel validation #####################################
+EzDHARma <- function(model1, model2, model3, model4,
+                     title1, title2, title3, title4) {
+  A1 <- as.ggplot(function() plot(simulateResiduals(model1)) )
+  AR <- StatisticalModels::GLMEROverdispersion(model1)
+  A2 <- annotate_figure(annotate_figure(A1, top = text_grob(paste("Overdispersion test: P.Chisq =", AR$P.ChiSq))), top=text_grob(title1, color = "red", face = "bold", size = 14))
+  
+  B1 <- as.ggplot(function() plot(simulateResiduals(model2)) )
+  BR <- StatisticalModels::GLMEROverdispersion(model2)
+  B2 <- annotate_figure(annotate_figure(B1, top = text_grob(paste("Overdispersion test: P.Chisq =", BR$P.ChiSq))), top=text_grob(title2, color = "red", face = "bold", size = 14))
+  
+  C1 <- as.ggplot(function() plot(simulateResiduals(model3)) )
+  CR <- StatisticalModels::GLMEROverdispersion(model3)
+  C2 <- annotate_figure(annotate_figure(C1, top = text_grob(paste("Overdispersion test: P.Chisq =", CR$P.ChiSq))), top=text_grob(title3, color = "red", face = "bold", size = 14))
+  
+  D1 <- as.ggplot(function() plot(simulateResiduals(model4)) )
+  DR <- StatisticalModels::GLMEROverdispersion(model4)
+  D2 <- annotate_figure(annotate_figure(D1, top = text_grob(paste("Overdispersion test: P.Chisq =", DR$P.ChiSq))), top=text_grob(title4, color = "red", face = "bold", size = 14))  
+  
+  ggarrange(A2, B2, C2, D2, labels = c("A.)", "B.)", "C.)", "D.)", nrow = 2, nocl = 2))
+}
+
+
+###### Consumers ###### 
+EzDHARma(AS1_Last_YSC_biome$model ,BS1_Carnivore_first_YSC_LUI$model, BS1_Herbivore_last_YSC_LUI$model, BS1_Omnivore_last_YSC_LUI$model,
+         "Consumers: LUTI + Last covnersion", "Carnivores: LUTI + First conversion", "Herbivores: LUTI + Last conversion", "Omnivores: Last conversion")
+
+###### Producers ###### 
+EzDHARma(AS2_Last_YSC$model ,BS2_C_last_YSC$model, BS2_S_first_YSC_LUI$model, BS2_R_last_YSC$model,
+         "Producers: Last covnersion", "C-strategy: Last conversion", "S-strategy: LUTI + First conversion", "R-strategy: Last conversion")
+
+###### Decomposers ###### 
+EzDHARma(AS3_Last_YSC$model ,BS3_Sym_last_YSC$model, BS3_Sapro_last_YSC$model, BS3_Path_last_YSC$model,
+         "Decomposers: Last covnersion", "Symbotrophs: Last conversion", "Saprotrophs: Last conversion", "Pathotrophs: Last conversion")
+```
+# 3.11 ALL Spatial autocorrelation:
+```{r}
+EzSpatialgraph <- function(model1, model2, model3, model4, title1, title2, title3, title4) {
+  A <- EzSpatialcheck(model1, title1)
+  B <- EzSpatialcheck(model2, title2)
+  C <- EzSpatialcheck(model3, title3)
+  D <- EzSpatialcheck(model4, title4)
+  
+  ggarrange(A, B, C, D, labels = c("A.)", "B.)", "C.)", "D.)", ncol = 2, nrow = 2))
+}
+
+EzSpatialgraphAll <- function(model1, model2, model3, model4, title1, title2, title3, title4) {
+  A <- EzSpatialcheck(model1, title1)
+  B <- EzSpatialcheck(model2, title2)
+  C <- EzSpatialcheck(model3, title3)
+  D <- EzSpatialcheck(model4, title4)
+  
+  ggarrange(A, B, C, D, ncol = 2, nrow = 2)
+}
+
+
+ggarrange(
+  EzSpatialgraphAll(AS1_Last_YSC_biome, BS1_Carnivore_first_YSC_LUI, BS1_Herbivore_last_YSC_LUI, BS1_Omnivore_last_YSC, 
+               "Consumers: LUTI + Last covnersion", "Carnivores: LUTI + First conversion", "Herbivores: LUTI + Last conversion", "Omnivores: Last conversion"),
+EzSpatialgraphAll(AS2_Last_YSC ,BS2_C_last_YSC, BS2_S_first_YSC_LUI, BS2_R_last_YSC, 
+               "Producers: Last covnersion", "C-strategy: Last conversion", "S-strategy: LUTI + First conversion", "R-strategy: Last conversion"),
+EzSpatialgraphAll(AS3_Last_YSC ,BS3_Sym_last_YSC, BS3_Sapro_last_YSC, BS3_Path_last_YSC,
+         "Decomposers: Last covnersion", "Symbotrophs: Last conversion", "Saprotrophs: Last conversion", "Pathotrophs: Last conversion"), ncol = 1, nrow = 3, labels = c("A.)", "B.)", "C.)"))
+```
+
+
+# 4. ALL AIC data
+```{r, fig.width=15}
+EzAICSort <- function(AICdf, fg) {
+  A <- AICdf %>% mutate("FG" = fg) %>% select(FG ,Fixed_effect, Random_effect, AIC, Weights) 
+  A
+}
+
+############# Trophic levels #############
+AIC_Trophic <- readRDS("AIC_Trophic_levels.rds") 
+
+############# Fucntional groups #############
+AIC1_Car <- EzAICSort(B1_AIC_Carnivore_Final, "Carnivores")
+AIC1_Herb <- EzAICSort(B1_AIC_Herbivore_Final, "Herbivores")
+AIC1_Om <- EzAICSort(B1_AIC_Omnivore_Final, "Omnivores")
+
+AIC2_C <- EzAICSort(B2_AIC_C_Final, "C")
+AIC2_S <- EzAICSort(B2_AIC_S_Final, "S")
+AIC2_R <- EzAICSort(B2_AIC_R_Final, "R")
+
+AIC3_Sym <- EzAICSort(B3_AIC_Sym_Final, "Symbiotrophs")
+AIC3_Sapro <- EzAICSort(B3_AIC_Sapro_Final, "Saprotrophs")
+AIC3_Path <- EzAICSort(B3_AIC_Path_Final, "Pathotrophs")
+
+############## Combining Trophic levels and Functional groups #############
+AIC_ALL <- rbind(
+      AIC_Trophic, 
+      AIC1_Car, AIC1_Herb, AIC1_Om,
+      AIC2_C, AIC2_S, AIC2_R,
+      AIC3_Sym, AIC3_Sapro, AIC3_Path)
+
+AIC_Plot <- AIC_ALL %>% select(FG, Fixed_effect, Weights)
+AIC_Plot$FG <- factor(AIC_Plot$FG, levels = c("Producers" ,"C", "S", "R", "Consumers" , "Carnivores", "Herbivores", "Omnivores", "Decomposers" ,"Symbiotrophs", "Saprotrophs", "Pathotrophs"))
+AIC_Plot$Fixed_effect <- factor(AIC_Plot$Fixed_effect, levels = c("Land_use_intensity*Since_first_conversion_log",
+                                                                  "Land_use_intensity+Since_first_conversion_log",
+                                                                  "Since_first_conversion_log",
+                                                                  "Land_use_intensity*Since_last_conversion_log",
+                                                                  "Land_use_intensity+Since_last_conversion_log",
+                                                                  "Since_last_conversion_log",
+                                                                  "Land_use_intensity",
+                                                                  "1"))
+```
+
+## 4.1. AIC table plotted
+```{r, fig.width=15}
+############## Plotting
+# labels = c("Land use + First conversion", "First conversion","Land use + Last conversion", "Last conversion")
+EZAICPlot <- function(df, fg) {
+  A <- df
+  B <- c("Land_use_intensity*Since_first_conversion_log" = "darkolivegreen1",
+         "Land_use_intensity+Since_first_conversion_log" = "darkolivegreen3",
+         "Since_first_conversion_log" = "chartreuse4",
+         "Land_use_intensity*Since_last_conversion_log" = "lightgoldenrod",
+         "Land_use_intensity+Since_last_conversion_log" = "orange",
+         "Since_last_conversion_log" = "darkgoldenrod3",
+         "Land_use_intensity" = "red",
+         "1" = "grey40")
+  ggplot() + 
+  geom_col(data = df, aes(x = FG, y = Weights, fill = Fixed_effect, width = 0.7),  position = position_dodge(), col = "black") +
+  scale_fill_manual(name = "Fixed effect terms", values = B, labels = c("LUTI * First conversion",
+                                                                  "LUTI + First conversion",
+                                                                  "First conversion",
+                                                                  "LUTI * Last conversion",
+                                                                  "LUTI + Last conversion",
+                                                                  "Last conversion",
+                                                                  "LUTI",
+                                                                  "NULL")) +  
+  theme_classic()  +
+  theme(legend.position="bottom") +  
+  theme(axis.text.y=element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x=element_text(angle=45, hjust=1, size = 16),
+        axis.title.x = element_text(vjust = -0.75, size = 16),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20)) + 
+  theme(text = element_text(size = 15))  +
+  labs(title = fg, x = "Trophic levels and Functional groups", y = "AIC weight")  
+}
+
+# 
+
+ggarrange(
+  EZAICPlot(AIC_Plot %>% filter(FG == "Producers" | FG == "C" | FG == "S" | FG == "R"), "Producers")  + 
+    rremove("xlab"),
+  EZAICPlot(AIC_Plot %>% filter(FG == "Consumers" | FG == "Carnivores" | FG == "Herbivores" | FG == "Omnivores"), "Consumers") + 
+    rremove("ylab"),
+  EZAICPlot(AIC_Plot %>% filter(FG == "Decomposers" | FG == "Symbiotrophs" | FG == "Saprotrophs" | FG == "Pathotrophs"), "Decomposers") + 
+  rremove("ylab") + rremove("xlab"),
+  ncol = 3, nrow = 1,
+  align = "hv",
+  common.legend = TRUE, legend = "bottom",
+  font.label = list(size = 10, color = "black", face = "bold", family = NULL, position = "top", labels = c("A.)", "B.)", "C)"))
+  )
+
+```
+
+## 4.2. AIC YSC:
+```{r}
+AIC_Plot2 <- AIC_Plot %>% filter(Fixed_effect == "Land_use_intensity+Since_first_conversion_log" |
+                                 Fixed_effect == "Since_first_conversion_log" |   
+                                 Fixed_effect == "Land_use_intensity+Since_last_conversion_log" |
+                                 Fixed_effect == "Since_last_conversion_log")
+AIC_Plot2$Fixed_effect <- factor(AIC_Plot2$Fixed_effect, levels = c("Land_use_intensity+Since_first_conversion_log",
+                                                                  "Since_first_conversion_log",
+                                                                  "Land_use_intensity+Since_last_conversion_log",
+                                                                  "Since_last_conversion_log"))
+
+EZAICPlotYSC <- function(df, fg) {
+  A <- df
+  B <- c("Land_use_intensity*Since_first_conversion_log" = "darkolivegreen1",
+         "Land_use_intensity+Since_first_conversion_log" = "darkolivegreen3",
+         "Since_first_conversion_log" = "chartreuse4",
+         "Land_use_intensity*Since_last_conversion_log" = "lightgoldenrod",
+         "Land_use_intensity+Since_last_conversion_log" = "orange",
+         "Since_last_conversion_log" = "darkgoldenrod3",
+         "Land_use_intensity" = "red",
+         "1" = "grey40")
+  ggplot() + 
+  geom_col(data = df, aes(x = FG, y = Weights, fill = Fixed_effect, width = 0.7),  position = position_dodge(), col = "black") +
+  scale_fill_manual(name = "Fixed effect terms", values = B, labels = c("LUTI + First conversion",
+                                                                  "First conversion",
+                                                                  "LUTI + Last conversion",
+                                                                  "Last conversion")) +  
+  theme_classic()  +
+  theme(legend.position="bottom") +  
+  theme(axis.text.y=element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x=element_text(angle=45, hjust=1, size = 16),
+        axis.title.x = element_text(vjust = -0.75, size = 16),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20)) + 
+  theme(text = element_text(size = 15))  +
+  labs(title = fg, x = "Trophic levels and Functional groups", y = "AIC weight")  
+}
+
+ggarrange(
+  EZAICPlotYSC(AIC_Plot2 %>% filter(FG == "Producers" | FG == "C" | FG == "S" | FG == "R"), "Producers")  + 
+    rremove("xlab"),
+  EZAICPlotYSC(AIC_Plot2 %>% filter(FG == "Consumers" | FG == "Carnivores" | FG == "Herbivores" | FG == "Omnivores"), "Consumers") + 
+    rremove("ylab"),
+  EZAICPlotYSC(AIC_Plot2 %>% filter(FG == "Decomposers" | FG == "Symbiotrophs" | FG == "Saprotrophs" | FG == "Pathotrophs"), "Decomposers") + 
+  rremove("ylab") + rremove("xlab"),
+  ncol = 3, nrow = 1,
+  align = "hv",
+  common.legend = TRUE, legend = "bottom",
+  font.label = list(size = 10, color = "black", face = "bold", family = NULL, position = "top"
+  ))
+```
+## 4.3. AIC LUI
+```{r}
+######################### Data #########################
+AIC_Plot3 <- AIC_Plot %>% filter(!(Fixed_effect == "1")) %>% mutate(Fixed_effect_grouped = Fixed_effect)
+AIC_Plot3$Fixed_effect_grouped <- dplyr::recode(AIC_Plot3$Fixed_effect_grouped, 
+                                                "Land_use_intensity*Since_first_conversion_log" = "Land use and Hisotry",
+                                                "Land_use_intensity+Since_first_conversion_log" = "Land use and Hisotry",
+                                                "Land_use_intensity*Since_last_conversion_log" = "Land use and Hisotry",
+                                                "Land_use_intensity+Since_last_conversion_log" = "Land use and Hisotry",
+                                                "Land_use_intensity" = "Land use",
+                                                "Since_first_conversion_log" = "Land use History",
+                                                "Since_last_conversion_log" = "Land use History") 
+AIC_Plot3 <- AIC_Plot3 %>% group_by(FG, Fixed_effect_grouped) %>% summarise(Cumulative_AIC = sum(Weights))
+  
+AIC_Plot3$Fixed_effect_grouped <- factor(AIC_Plot3$Fixed_effect_grouped, levels = c("Land use and Hisotry",
+                                                                  "Land use",
+                                                                  "Land use History"))
+
+
+EZAICPlotLUI <- function(df, fg) {
+  A <- df
+  B <- c("Land use and Hisotry" = "blue",
+         "Land use" = "red",
+         "Land use History"  = "black")
+  ggplot() + 
+  geom_col(data = df, aes(x = FG, y = Cumulative_AIC, fill = Fixed_effect_grouped, width = 0.7),  position = position_dodge(), col = "black") +
+  scale_fill_manual(name = "Fixed effect terms", values = B, labels = c("LUTI and LUH", "LUTI", "LUH")) +  
+  theme_classic()  +
+  theme(legend.position="bottom") +  
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        axis.title.x = element_text(vjust = -0.75, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20)) + 
+  theme(text = element_text(size = 15))  +
+  labs(title = fg, x = "Trophic levels and Functional groups", y = "Cumulative AIC weight")  
+}
+
+ggarrange(
+  EZAICPlotLUI(AIC_Plot3 %>% filter(FG == "Producers" | FG == "C" | FG == "S" | FG == "R"), "Producers")  + 
+    rremove("xlab"),
+  EZAICPlotLUI(AIC_Plot3 %>% filter(FG == "Consumers" | FG == "Carnivores" | FG == "Herbivores" | FG == "Omnivores"), "Consumers") + 
+    rremove("ylab"),
+  EZAICPlotLUI(AIC_Plot3 %>% filter(FG == "Decomposers" | FG == "Symbiotrophs" | FG == "Saprotrophs" | FG == "Pathotrophs"), "Decomposers") + 
+  rremove("ylab") + rremove("xlab"),
+  ncol = 3, nrow = 1,
+  align = "hv",
+  common.legend = TRUE, legend = "bottom",
+  font.label = list(size = 10, color = "black", face = "bold", family = NULL, position = "top")
+  )
+```
+
+
+# 5. YSC plots
+## 5.1. Data LUI+YSC
+```{r}
+################################ For last conversion 
+EzLU <- function(model1, lu){
+  DATA <- model1$data 
+  DATA$Land_use_intensity <- factor(DATA$Land_use_intensity)
+  
+nd <- with(
+  DATA, 
+  data.frame(
+  Since_last_conversion_log = seq(from = 0, to = 7.061334, length.out = 100),
+  Land_use_intensity = factor(x = lu, levels = levels(Land_use_intensity)), 
+  Species_richness=0))
+  
+nd$AgeConv <- exp(nd$Since_last_conversion_log)- 1
+
+preds <- PredictGLMERRandIter(model = model1$model, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower,
+                       "Group" = lu) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+
+preds.df 
+}
+
+################################ For first conversion 
+EzFU <- function(model1, lu){
+  DATA <- model1$data 
+  DATA$Land_use_intensity <- factor(DATA$Land_use_intensity)
+  
+nd <- with(
+  DATA, 
+  data.frame(
+  Since_first_conversion_log = seq(from = 0, to = 7.061334, length.out = 100),
+  Land_use_intensity = factor(x = lu, levels = levels(Land_use_intensity)), 
+  Species_richness=0))
+  
+nd$AgeConv <- exp(nd$Since_first_conversion_log)- 1
+
+preds <- PredictGLMERRandIter(model = model1$model, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower,
+                       "Group" = lu) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+
+preds.df 
+}
+
+################################ For last conversion 
+EzMedian <- function(model1) {
+  A <- model1
+  LU_list <-  A$data %>% mutate(Y = 1) %>% group_by(Land_use_intensity) %>% summarise(Z = sum(Y)) %>% 
+    select(Land_use_intensity) %>% unlist() %>% as.character()
+  Temp_list <- list()
+  
+  for(values in 1:length(LU_list)) {
+    Temp_list[[values]] <- EzLU(A , LU_list[values]) # Using the EZLU() function to predict median, upper and lower for each land use
+    names(Temp_list)[[values]] <- noquote((LU_list[values])) # Record the data in a list by their land use intensity
+  }
+
+  B <- do.call(rbind.data.frame, Temp_list)
+  B
+}
+
+################################ For first conversion 
+EzMedianfirst <- function(model1) {
+  A <- model1
+  LU_list <-  A$data %>% mutate(Y = 1) %>% group_by(Land_use_intensity) %>% summarise(Z = sum(Y)) %>% 
+    select(Land_use_intensity) %>% unlist() %>% as.character()
+  Temp_list <- list()
+  
+  for(values in 1:length(LU_list)) {
+    Temp_list[[values]] <- EzFU(A , LU_list[values]) # Using the EZLU() function to predict median, upper and lower for each land use
+    names(Temp_list)[[values]] <- noquote((LU_list[values])) # Record the data in a list by their land use intensity
+  }
+
+  B <- do.call(rbind.data.frame, Temp_list)
+  B
+}
+
+########################### Consumer FG ###########################
+BP1_Car <- EzMedian(BS1_Carnivore_last_YSC_LUI) # 8
+BP1_Car_first <- EzMedianfirst(BS1_Carnivore_first_YSC_LUI)
+
+BP1_Herb <- EzMedian(BS1_Herbivore_last_YSC_LUI) # 8
+
+TP1_Om <- EzMedian(BS1_Omnivore_last_YSC_LUI)
+TP1_Om2 <- EzMedian(BS1_Omnivore_last_YSC_LUI_test)
+########################### Producer FG ###########################
+BP2_S <- EzMedianfirst(BS2_S_first_YSC_LUI) # First conversion here! 7 Land uses here!
+
+TP2_C <- EzMedian(BS2_C_last_YSC_LUI)
+TP2_R <-EzMedian(BS2_R_last_YSC_LUI)
+
+########################### Decomposer FG ###########################
+
+TP3_Sym <- EzMedian(BS3_Sym_last_YSC_LUI)
+TP3_Sapro <- EzMedian(BS3_Sapro_last_YSC_LUI)
+TP3_Path <- EzMedian(BS3_Path_last_YSC_LUI)
+
+```
+
+
+## 5.2. Data YSC
+```{r}
+############################################### Function for YSC only: For everyone but saprotrophs ###############################################
+EzYSC <- function(model1){
+  DATA <- model1$data 
+  
+nd <- with(
+  DATA, 
+  data.frame(
+  Since_last_conversion_log = seq(from = 0, to = 7.061334, length.out = 100), 
+  Species_richness=0))
+  
+nd$AgeConv <- exp(nd$Since_last_conversion_log)- 1
+
+preds <- PredictGLMERRandIter(model = model1$model, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+
+preds.df 
+}
+
+############################################### Function for YSC only: For saprotrophs only ###############################################
+EzYSC_sapro <- function(df, model1){
+  DATA <- df %>% mutate(Since_last_conversion_log_scaled = scale(Since_last_conversion_log))
+  Mean <- mean(DATA$Since_last_conversion_log)
+  SD <- sd(DATA$Since_last_conversion_log)
+  
+nd <- with(
+  DATA, 
+  data.frame(
+  Since_last_conversion_log_scaled = seq(from = -1.0627860, to = 0.9691136, length.out = 100), 
+  Species_richness=0))
+
+nd <- nd %>% mutate(AgeConv = round(exp((Since_last_conversion_log_scaled * SD) + Mean) - 1, 5))
+
+preds <- PredictGLMERRandIter(model = model1, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+
+preds.df
+ 
+}
+
+## Consumer FG
+BP1_Omnivore_YSC <- EzYSC(BS1_Omnivore_last_YSC)
+
+## Producer FG
+BP2_C <- EzYSC(BS2_C_last_YSC)
+BP2_R <- EzYSC(BS2_R_last_YSC)
+
+## Decomposer FG
+BP3_Sym <- EzYSC(BS3_Sym_last_YSC)
+BP3_Sapro <- EzYSC(BS3_Sapro_last_YSC) 
+BP3_Path <- EzYSC(BS3_Path_last_YSC)
+
+```
+
+## 5.3. YSC + LUI plot
+```{r}
+
+EzAIC2Plot <- function(model1, df, sz, alp, title1, xlab1, xlim1, x1, y1, rank, r2) {
+  A <- df
+  A$Group <- factor(A$Group, levels = c(" ", "A_PV", "B_SV",
+                                      "C1_AG_Min", "C2_AG_Int", "C3_AG_Max",
+                                      "D1_Urban_Min", "D2_Urban_Int", "D3_Urban_Max"))
+  Summary <- summary(model1$model)
+  Estimate <- round((Summary$coefficients[2,1]), 5)
+  
+  Trophic_colors <- c(
+  " " = "grey95",
+  "A_PV" = "darkgreen",
+  "B_SV" = "darkolivegreen3",
+  "C1_AG_Min" = "darkblue",
+  "C2_AG_Int" = "cyan3",
+  "C3_AG_Max" = "darkviolet",
+  "D1_Urban_Min" = "sandybrown",
+  "D2_Urban_Int" = "deeppink",
+  "D3_Urban_Max" = "darkred"
+  )
+  
+  ggplot() + 
+  # PV
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = Group, group = Group), size = sz) +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = Group), alpha = alp) +
+  scale_color_manual(name = "Land use intensity:", values = c(Trophic_colors, "grey95"), label = c(" ", "PV", "SV","AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int", "Urban-Max"), drop=FALSE) +
+  scale_fill_manual(values = c(Trophic_colors, "grey95"), guide = "none") + 
+  theme_classic() + 
+  labs(title = title1, subtitle = bquote(.(rank) ~ R^2 ~.(r2)), x = xlab1, y = "Species richness") + xlim(xlim1) +
+  theme(legend.position="right", 
+        text = element_text(size=12),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(colour="black", size=12,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=12, linetype="solid")) + 
+  scale_x_continuous(trans = "log", 
+                     breaks = c(0.1, 1, 10, 50, 200, 1200),
+                     labels = c(0.1, 1, 10, 50, 200, 1200)) +
+  guides(col =guide_legend(nrow=3, ncol = 3)) +
+  annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate))  
+}
+
+```
+
+
+## 5.4. YSC function:
+```{r}
+################################################ Function for plotting YSC ONLY ################################################
+EzYSCPlot2 <- function(model1, df1, xlim1, xlim2, x1, y1, sz ,title1, xlab1, rank, r2) {
+  A <- df1 %>% filter(Since_conversion >= xlim1 & Since_conversion <= xlim2)
+  Summary <- summary(model1$model)
+  Estimate <- round((Summary$coefficients[2,1]), 5)
+
+  ggplot() + 
+  geom_line(data = A, aes(x = Since_conversion, y = Median), size = sz, col = "ivory4") +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion), alpha = 0.2, fill = "ivory4") + 
+  annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate)) +  
+    
+  theme_classic() + 
+  labs(title = title1, subtitle = bquote(.(rank) ~ R^2 ~.(r2)), x = xlab1, y = "Species richness")  + 
+  scale_x_continuous(trans = "log", 
+                       breaks = c(0.1, 1, 10, 50, 200, 1200),
+                       labels = c(0.1, 1, 10, 50, 200, 1200)) +
+  theme(legend.position="bottom", 
+        text = element_text(size=12),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(colour="black", size=12,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=12, linetype="solid"))
+}
+
+################################################ Function for plotting YSC for decomposers together ################################################
+EzYSCPlotDecomposers <- function(model1, model2, model3, model4, 
+                                 df1, df2, df3, df4,
+                                 x1, y1, x2, y2, x3, y3, x4, y4,
+                                 xlim1, xlim2, 
+                                 sz, alp ,
+                                 title1, xlab1) {
+  A <- df1 %>% filter(Since_conversion >= xlim1 & Since_conversion <= xlim2)
+  B <- df2 %>% filter(Since_conversion >= xlim1 & Since_conversion <= xlim2)
+  C <- df3 %>% filter(Since_conversion >= xlim1 & Since_conversion <= xlim2)
+  D <- df4 %>% filter(Since_conversion >= xlim1 & Since_conversion <= xlim2)
+  FG_color <- c("Decomposers" = "coral",
+                "Symbiotrophs" = "aquamarine2",
+                "Saprotrophs" = "blue",
+                "Pathotrophs" = "red")
+  
+  Estimate1 <- round(summary(model1$model)$coefficients[2,1], 5)
+  Estimate2 <- round(summary(model2$model)$coefficients[2,1], 5)
+  Estimate3 <- round(summary(model3$model)$coefficients[2,1], 5)
+  Estimate4 <- round(summary(model4$model)$coefficients[2,1], 5)
+
+  ggplot() + 
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = "Decomposers"), size = sz) +  
+    geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = "Decomposers"), alpha = alp) + 
+    annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate1), color = "coral") +
+  geom_line(data = B, aes(x = Since_conversion, y = Median, col = "Symbiotrophs"), size = sz) +  
+    geom_ribbon(data = B, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = "Symbiotrophs"), alpha = alp) +
+    annotate(geom = "text",x = x2, y = y2, label = paste("m =", Estimate2), color = "turquoise4") +
+  geom_line(data = C, aes(x = Since_conversion, y = Median, col = "Saprotrophs"), size = sz) +  
+    geom_ribbon(data = C, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = "Saprotrophs"), alpha = alp) +
+    annotate(geom = "text",x = x3, y = y3, label = paste("m =", Estimate3), color = "blue") +
+  geom_line(data = D, aes(x = Since_conversion, y = Median, col = "Pathotrophs"), size = sz) +  
+    geom_ribbon(data = C, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = "Pathotrophs"), alpha = alp) +
+    annotate(geom = "text",x = x4, y = y4, label = paste("m =", Estimate4), color = "red") +
+  theme_classic() + 
+  labs(title = title1, x = xlab1, y = "Species richness")  +
+    scale_color_manual(name = "Trophic level and Functional groups", values = FG_color, position = "bottom", breaks = c("Decomposers","Symbiotrophs", "Saprotrophs", "Pathotrophs")) + 
+    scale_fill_manual(values = FG_color, guide = "none") + scale_x_continuous(trans = "log", 
+                                                              breaks = c(0.1, 1, 10, 50, 200, 1200),
+                                                              labels = c(0.1, 1, 10, 50, 200, 1200)) +
+    theme(legend.position="bottom", 
+        text = element_text(size=16),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.title = element_text(colour="black", size=16,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=16, linetype="solid"))
+}
+
+
+```
+
+
+# 6. Final YSC graph here:
+## 6.1. F-Consumers:
+```{r, fig.width=10, fig.height=10}
+################################# Combination of graphs from 5.1 and 5.2 #################################
+####################################### YSC +- LUI #######################################
+ggarrange(EzAIC1Plot(AS1_Last_YSC_biome ,AP1_Consumers, 
+                     sz = 2, alp = 0.2, 
+                     "Consumers", 
+                     "Years-since last conversion", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.273,",
+                     "= 0.04%"),
+          EzAIC2Plot(BS1_Carnivore_last_YSC_LUI ,BP1_Car, sz = 2, 
+                     "Consumers: Carnivore", 
+                     "Years-since last conversion", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 5.5,
+                     "AIC weight = 0.209,",
+                     "= 0.073%"),
+          EzAIC2Plot(BS1_Herbivore_last_YSC_LUI, BP1_Herb, 2, 
+                     "Consumers: Herbivores", 
+                     "Years-since last conversion", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 3.7,
+                     "AIC weight = 0.297,",
+                     "= 0.093%"),
+          EzYSCPlot2(BS1_Omnivore_last_YSC, BP1_Omnivore_YSC, 
+            xlim1 =  0, xlim2 =  1165, 
+            x1 = 220, y1 = 1.51, 
+            sz =  2,
+            title1 = "Consumers: Omnivores", 
+            xlab1 = "Years-since last conversion",
+            "AIC weight = 0.211,",
+            "= 0.0003%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+ggarrange(EzAIC1Plot(AS1_Last_YSC_biome ,AP1_Consumers, 
+                     sz = 2, alp = 0.2, 
+                     "Consumers", 
+                     "Years-since last conversion", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.273,",
+                     "= 0.04%"),
+          EzAIC2Plot(BS1_Carnivore_first_YSC_LUI ,BP1_Car_first, sz = 2, 
+                     "Consumers: Carnivores", 
+                     "Years-since first conversion", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 5.5,
+                     "AIC weight = 0.223,",
+                     "= 0.074%"),
+          EzAIC2Plot(BS1_Herbivore_last_YSC_LUI, BP1_Herb, 2, 
+                     "Consumers: Herbivores", 
+                     "Years-since last conversion", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 3.7,
+                     "AIC weight = 0.297,",
+                     "= 0.093%"),
+          EzYSCPlot2(BS1_Omnivore_last_YSC, BP1_Omnivore_YSC, 
+            xlim1 =  0, xlim2 =  1165, 
+            x1 = 220, y1 = 1.51, 
+            sz =  2,
+            title1 = "Consumers: Omnivores", 
+            xlab1 = "Years-since last conversion",
+            "AIC weight = 0.211,",
+            "= 0.0003%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+####################################### YSC + LUI #######################################
+ggarrange(EzAIC1Plot(AS1_Last_YSC_biome ,AP1_Consumers, 
+                     sz = 2, alp = 0.2, 
+                     "Consumers", 
+                     "Years since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.273,",
+                     "= 0.04%"),
+          EzAIC2Plot(BS1_Carnivore_last_YSC_LUI ,BP1_Car, sz = 2, 
+                     "Consumers: Carnivore", 
+                     "Years-since last conversions", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 5.5,
+                     "AIC weight = 0.209,",
+                     "= 0.073%"),
+          EzAIC2Plot(BS1_Herbivore_last_YSC_LUI, BP1_Herb, 2, 
+                     "Consumers: Herbivores", 
+                     "Years-since last conversions", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 3.7,
+                     "AIC weight = 0.297,",
+                     "= 0.093%"),
+          EzAIC2Plot(BS1_Omnivore_last_YSC_LUI ,TP1_Om, sz = 2, 
+                     "Consumers: Omnivores", 
+                     "Years-since last conversions", 
+                     alp = 0.1, c(0, 1165),
+                     x1 = 200, y1 = 2.5,
+                     "AIC weight = 0.001,",
+                     "= 0.066%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+```
+## 6.2. F-Producers:
+```{r, fig.width=10, fig.height=10}
+################################# Combination of graphs from 5.1 and 5.2 #################################
+####################################### YSC +- LUI #######################################
+ggarrange(EzYSCPlot2(AS2_Last_YSC_only, AP2_Producers_YSC, 
+            xlim1 =  0, xlim2 =  1165, 
+            x1 = 200, y1 = 15.8, 
+            sz =  2,
+            title1 = "Producers", 
+            xlab1 = "Years-since last conversion",
+            "AIC weight = 0.541,",
+            "= 0.113%"),
+          EzYSCPlot2(BS2_C_last_YSC, BP2_C, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 1.53, 
+                     sz = 2,
+                     title1 = "Producers: C-strategy", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.226,",
+                     "= 0.096%"), 
+          EzAIC1PlotProducer_with_LUI(BS2_S_first_YSC_LUI, BP2_S, sz = 2, alp = 0.1, 
+                     "Producers: S-strategy", 
+                     "Years-since first conversion", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 1.58,
+                     "AIC weight = 0.171,",
+                     "= 0.036%"),
+          EzYSCPlot2(BS2_R_last_YSC, BP2_R, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 1.34,
+                     sz = 2,
+                     title1 = "Producers: R-strategy", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.179,",
+                     "= 0.01%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+
+
+####################################### YSC + LUI #######################################
+ggarrange(EzAIC1PlotProducer(AS2_Last_YSC , AP2_Producers, sz = 2, alp = 0.1, 
+                     "Producers", "Years-since last conversions", 
+                     c(0, 1165),
+                     x1= 200, y1 = 13,
+                     "AIC weight = 0.224,",
+                     "= 0.17%"),
+          EzAIC1PlotProducer(BS2_C_last_YSC_LUI, TP2_C, sz = 2, alp = 0.1, 
+                     "Producers: C-strategy", 
+                     "Years-since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 1.7,
+                     "AIC weight = 0.076,",
+                     "= 0.356%"), 
+          EzAIC1PlotProducer(BS2_S_first_YSC_LUI, BP2_S, sz = 2, alp = 0.1, 
+                     "Producers: S-strategy", 
+                     "Years-since first conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 1.58,
+                     "AIC weight = 0.171,",
+                     "= 0.036%"),
+          EzAIC1PlotProducer(BS2_R_last_YSC_LUI, TP2_R, sz = 2, alp = 0.1, 
+                     "Producers: R-strategy", 
+                     "Years-since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 1.7,
+                     "AIC weight = 0.056,",
+                     "= 0.172%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+
+```
+
+## 6.3. F-Decomposers:
+```{r, fig.height=10, fig.width=10}
+EzYSCPlotDecomposers(
+  model1 = AS3_Last_YSC, model2 = BS3_Sym_last_YSC, model3 = BS3_Sapro_last_YSC, model4 = BS3_Path_last_YSC,
+  df1 = AP3_Decomposers_YSC, df2 = BP3_Sym, df3 = BP3_Sapro, df4 = BP3_Path, 
+  xlim1 = 0, xlim2 = 1165,
+  x1 = 200, y1 = 7.4, x2 = 200, y2 = 8.7, x3 = 200, y3 = 3.6, x4 = 200, y4 = 1,
+  sz = 1.5, alp = 0.1, 
+  "Decomposer functional groups", 
+  "Years-since last conversion")
+
+####################################### YSC +- LUI #######################################
+ggarrange(EzYSCPlot2(AS3_Last_YSC, AP3_Decomposers_YSC, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 8.2,
+                     sz = 2,
+                     title1 = "Decomposers", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.367,",
+                     "= 0.124%"),
+          EzYSCPlot2(BS3_Sym_last_YSC, BP3_Sym, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 9,
+                     sz = 2,
+                     title1 = "Decomposers: Symbiotrophs", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.179,",
+                     "= 0.227%"), 
+          EzYSCPlot2(BS3_Sapro_last_YSC, BP3_Sapro, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 3.8,
+                     sz = 2,
+                     title1 = "Decomposers: Saprotrophs", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.155,",
+                     "= 0.57%"),
+          EzYSCPlot2(BS3_Path_last_YSC, BP3_Path, 
+                     xlim1 = 0, xlim2 = 1165, 
+                     x1 = 200, y1 = 0.52,
+                     sz = 2,
+                     title1 = "Decomposers: Pathotrophs", 
+                     xlab1 = "Years-since last conversion",
+                     "AIC weight = 0.182,",
+                     "= 0.625%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+####################################### YSC + LUI #######################################
+ggarrange(EzAIC1Plot(AS3_Last_YSC_LUI ,AP3_Decomposers, 
+                     sz = 2, alp = 0.2, 
+                     "Decomposers", 
+                     "Years since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.006,",
+                     "= 0.065%"),
+          EzAIC2Plot(BS3_Sym_last_YSC_LUI ,TP3_Sym, 
+                     sz = 2, alp = 0.2, 
+                     "Decomposers: Symbiotrophs", 
+                     "Years since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.037,",
+                     "= 3%"), 
+          EzAIC2Plot(BS3_Sapro_last_YSC ,TP3_Sapro, 
+                     sz = 2, alp = 0.2, 
+                     "Decomposers: Saprotrophs", 
+                     "Years since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.037,",
+                     "= 56%"),
+          EzAIC2Plot(BS3_Path_last_YSC_LUI ,TP3_Path, 
+                     sz = 2, alp = 0.2, 
+                     "Decomposers: Pathotrophs", 
+                     "Years since last conversions", 
+                     c(0, 1165),
+                     x1 = 200, y1 = 9.5,
+                     "AIC weight = 0.077,",
+                     "= 37.2%"), 
+          ncol = 2, nrow =2,
+          align = "hv",
+          common.legend = TRUE, legend = "bottom",
+          font.label = list(size = 16, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+```
+
+
+
+# 7. LUI only plot:
+## 7.1. Extracting coefficients
+```{r}
+Ezland <- function(model1, TLFG){
+######################### Intercept #########################  
+A <- fixef(model1$model)  %>% as.data.frame() %>% rename("Difference" = ".") %>% rownames_to_column("Variables") 
+
+Intercept <- A %>% filter(Variables == "(Intercept)") %>% select(Difference) %>% as.vector()
+Intercept_value <- Intercept$Difference
+
+B <- A %>% filter(!(Variables == "(Intercept)")) %>% mutate("Intercept_per_land" = Difference + Intercept_value) %>% select(-Difference)
+B$Variables <- gsub("Land_use_intensity", "", B$Variables)
+
+B1 <- data.frame(Variables = "A_PV", "Intercept_per_land" = Intercept_value)
+
+C <- rbind(B1, B)
+
+
+######################### Standard error #########################  
+D <- se.fixef(model1$model)  %>% as.data.frame() %>% rename("SE_per_land" = ".") %>% rownames_to_column("Variables_SE") 
+
+D$Variables_SE <- gsub("Land_use_intensity", "", D$Variables_SE)  
+D$Variables_SE <- dplyr::recode(D$Variables_SE, "(Intercept)" = "A_PV")
+
+
+######################### Combining intercept and SE #########################
+Final <- cbind(C, D) %>% select(-Variables_SE)
+Final2 <- Final %>% mutate(CI_new = SE_per_land*1.96,
+                           Upper_before = Intercept_per_land + CI_new,
+                           Lower_before = Intercept_per_land - CI_new,
+                           Intercept_reverse = exp(Intercept_per_land),
+                           Upper_reverse = exp(Upper_before),
+                           Lower_reverse = exp(Lower_before))
+
+Final3 <- Final2 %>% mutate(Intecept_Per = ((Intercept_reverse/Final2[1,7])*100)-100, # (Back-transformed value/Back-transformed intercept)*100 - 100
+                            Upper_Per = ((Upper_reverse)/Final2[1,7]*100)-100,
+                            Lower_Per = ((Lower_reverse)/Final2[1,7]*100)-100)
+
+Final3[1,11] <- 0 # Change only the Upper_reverse of PV to 0 (because we are comparing this with other, so its SE is not really important)
+Final3[1,12] <- 0 # Change only the Lower_reverse of PV to 0
+
+######################### Sample size #########################
+SampleSize <- dplyr::count(model1$data, Land_use_intensity) 
+
+Final4 <- cbind(Final3, SampleSize)
+
+Final5 <- Final4 %>% mutate(Group = TLFG) %>% relocate(Group)
+}
+
+
+BP1_Car_LUI <- Ezland(BS1_Carnivore_LUI, "Carnivores")
+BP1_Herb_LUI <- Ezland(BS1_Herbivore_LUI, "Herbivores")
+BP1_Om_LUI <- Ezland(BS1_Omnivore_LUI, "Omnivores")
+
+BP2_C_LUI <- Ezland(BS2_C_LUI, "C")
+BP2_S_LUI <- Ezland(BS2_S_LUI, "S")
+BP2_R_LUI <- Ezland(BS2_R_LUI, "R")
+
+BP3_Sym_LUI <- Ezland(BS3_Sym_LUI, "Symbiotrophs")
+BP3_Sapro_LUI <- Ezland(BS3_Sapro_LUI, "Saprotrophs")
+BP3_Path_LUI <- Ezland(BS3_Path_LUI, "Pathotrophs")
+
+dplyr::count(B3_Sapro, Land_use_intensity)
+
+```
+## 7.2. Plotting:
+```{r}
+EzlandplotFG <- function(df1, df2, df3, DW, EW, sz, sze, sz_sample, sztext, y1, title1, level1) {
+  A <- rbind(df1, df2, df3)
+  A$Group <- factor(A$Group, levels = level1)
+  TLFG_color <- c("Producers" = "olivedrab1",
+                  "Consumers" = "red",
+                  "Decomposers" = "saddlebrown",
+                  "Carnivores" = "darksalmon",
+                  "Herbivores" = "chartreuse",
+                  "Omnivores" = "gray",
+                  "C" = "yellowgreen",
+                  "S" = "lightgoldenrod",
+                  "R" = "springgreen",
+                  "Symbiotrophs" = "slateblue",
+                  "Saprotrophs" = "tan1",
+                  "Pathotrophs" = "indianred1")
+  
+  Best_model <- c("Producers" = "black",
+                  "Consumers" = "darkred",
+                  "Decomposers" = "black",
+                  "Carnivores" = "darkred",
+                  "Herbivores" = "darkred",
+                  "Omnivores" = "black",
+                  "C" = "darkred",
+                  "S" = "darkred",
+                  "R" = "black",
+                  "Symbiotrophs" = "black",
+                  "Saprotrophs" = "black",
+                  "Pathotrophs" = "black")
+
+  
+  ggplot() + 
+    geom_hline(yintercept = 0, col = "grey") +
+    geom_errorbar(data = A, aes(x = Variables, ymin = Lower_Per, ymax = Upper_Per, group = Group), 
+                  position = position_dodge(width = DW), 
+                  width = EW, 
+                  size = sze) +
+    geom_point(data = A, aes(x = Variables, y = Intecept_Per, group = Group, fill = Group), 
+               position = position_dodge(width = DW), 
+               size = sz,
+               shape =21,
+               col = "black",
+               stroke = 1.5) +
+    geom_text(data = A ,aes(x = Variables, y = y1, group = Group,label = n), position = position_dodge(DW), size = sz_sample, angle = 45, color = "grey") +
+  
+  theme_classic() + 
+  scale_x_discrete(expand=c(0.08, 0.08), label = c("PV", "SV", "AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int", "Urban-Max")) +
+  scale_fill_manual(name = "Functional groups",values = TLFG_color, position = "bottom") +
+  scale_colour_manual(values = Best_model, guide = "none") +
+    theme(legend.position="bottom") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x=element_text(angle=30, hjust=1),
+        axis.title.x = element_text(vjust = -0.75)) + 
+  theme(text = element_text(size = sztext)) +
+  theme(legend.title=element_blank()) +  
+  labs(y = "Species richness difference (%)", x = "Land use", title = title1)
+}
+
+EzlandplotFG_Decompoers <- function(df1, df2, DW, EW, sz, sze, sz_sample, sztext, y1, title1, level1) {
+  A <- rbind(df1, df2)
+  A$Group <- factor(A$Group, levels = level1)
+  TLFG_color <- c("Producers" = "olivedrab1",
+                  "Consumers" = "red",
+                  "Decomposers" = "saddlebrown",
+                  "Carnivores" = "darksalmon",
+                  "Herbivores" = "chartreuse",
+                  "Omnivores" = "gray",
+                  "C" = "yellowgreen",
+                  "S" = "lightgoldenrod",
+                  "R" = "springgreen",
+                  "Symbiotrophs" = "slateblue",
+                  "Saprotrophs" = "tan1",
+                  "Pathotrophs" = "indianred1")
+  
+  Best_model <- c("Producers" = "black",
+                  "Consumers" = "darkred",
+                  "Decomposers" = "black",
+                  "Carnivores" = "darkred",
+                  "Herbivores" = "darkred",
+                  "Omnivores" = "black",
+                  "C" = "darkred",
+                  "S" = "darkred",
+                  "R" = "black",
+                  "Symbiotrophs" = "black",
+                  "Saprotrophs" = "black",
+                  "Pathotrophs" = "black")
+
+  
+  ggplot() + 
+    geom_hline(yintercept = 0, col = "grey") +
+    geom_errorbar(data = A, aes(x = Variables, ymin = Lower_Per, ymax = Upper_Per, group = Group), 
+                  position = position_dodge(width = DW), 
+                  width = EW, 
+                  size = sze) +
+    geom_point(data = A, aes(x = Variables, y = Intecept_Per, group = Group, fill = Group), 
+               position = position_dodge(width = DW), 
+               size = sz,
+               shape =21,
+               col = "black",
+               stroke = 1.5) +
+    geom_text(data = A ,aes(x = Variables, y = y1, group = Group,label = n), position = position_dodge(DW), size = sz_sample, angle = 45, color = "grey")+
+  
+  theme_classic() + 
+  scale_x_discrete(expand=c(0.08, 0.08), label = c("PV", "SV", "AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int", "Urban-Max")) +
+  scale_fill_manual(name = "Functional groups",values = TLFG_color, position = "bottom") +
+  scale_colour_manual(values = Best_model, guide = "none") +
+    theme(legend.position="bottom") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x=element_text(angle=30, hjust=1),
+        axis.title.x = element_text(vjust = -0.75)) + 
+  theme(text = element_text(size = sztext)) +
+  theme(legend.title=element_blank()) +
+  labs(y = "Species richness difference (%)", x = "Land use", title = title1)
+}
+
+
+######################################### Sample size #########################################
+Ezsamplesize <- function(A1, A2, A3, B1C, B1H, B1O, B2C, B2S, B2R, B3Sym, B3Sapro, B3Path) {
+  A <- dplyr::count(A1, Land_use_intensity) %>% mutate(Group = "Consumers")
+  B <- dplyr::count(A2, Land_use_intensity) %>% mutate(Group = "Producers")
+  C <- dplyr::count(A3, Land_use_intensity) %>% mutate(Group = "Decomposers")
+  D <- dplyr::count(B1C, Land_use_intensity) %>% mutate(Group = "Carniovres")
+  E <- dplyr::count(B1H, Land_use_intensity) %>% mutate(Group = "Herbivores")  
+  FF <- dplyr::count(B1O, Land_use_intensity) %>% mutate(Group = "Omnivores")
+  G <- dplyr::count(B2C, Land_use_intensity) %>% mutate(Group = "C")
+  H <- dplyr::count(B2S, Land_use_intensity) %>% mutate(Group = "S") 
+  I <- dplyr::count(B2R, Land_use_intensity) %>% mutate(Group = "R")
+  J <- dplyr::count(B3Sym, Land_use_intensity) %>% mutate(Group = "Symbiotrophs")
+  K <- dplyr::count(B3Sapro, Land_use_intensity) %>% mutate(Group = "Saprotrophs")
+  L <- dplyr::count(B3Path, Land_use_intensity) %>% mutate(Group = "Pathotrophs")  
+  
+  Final <- rbind(A, B, C, D, E, FF, G, H, I, J, K, L) %>% relocate(Group)
+  Final
+}
+
+Overall_Sample_size <- Ezsamplesize(AS1_LUI$data, AS2_LUI$data, AS3_LUI$data,
+                   BS1_Carnivore_LUI$data, BS1_Herbivore_LUI$data, BS1_Omnivore_LUI$data,
+                   BS2_C_LUI$data, BS2_S_LUI$data, BS2_C_LUI$data,
+                   BS3_Sym_LUI$data, BS3_Sapro_LUI$data, BS3_Path_LUI$data)
+Overall_Sample_size <- Overall_Sample_size[order(Overall_Sample_size$Land_use_intensity),]
+
+```
+
+## 7.3. Final plot
+```{r, fig.width=20, fig.height=15}
+
+ggarrange(
+  Ezlandplot(AP1_Consumers_LUI, AP2_Producers_LUI, AP3_Decomposers_LUI, 
+             DW = 0.8, EW = 0.5, sz = 5,sze = 0.8, sz_sample = 4, sztext = 25, y1 = -90,
+             title1 = "All trophic levels") + rremove("xlab"),
+EzlandplotFG(BP1_Car_LUI, BP1_Herb_LUI, BP1_Om_LUI, 
+           DW = 0.9, EW = 0.5, sz = 5, sze = 0.8, sz_sample = 4, sztext = 25, y1 = -45, 
+           title1 = "Consumers functional groups",
+           level1 = c("Carnivores", "Herbivores", "Omnivores")) + rremove("ylab") + rremove("xlab"),
+EzlandplotFG(BP2_C_LUI, BP2_S_LUI, BP2_R_LUI, 
+           DW = 0.8, EW = 0.5, sz = 5, sze = 0.8, sz_sample = 4, sztext = 25, y1 = -70,
+           title1 = "Producers functional groups",
+           level1 = c("C", "S", "R")) + rremove("xlab"),
+EzlandplotFG_Decompoers(BP3_Sym_LUI, BP3_Sapro_LUI, 
+           DW = 0.8, EW = 0.5, sz = 5, sze = 0.8, sz_sample = 4, sztext = 25, y1 = -120,
+           title1 = "Decomposers functional groups",
+           level1 = c("Symbiotrophs", "Saprotrophs", "Pathotrophs")) + rremove("ylab") + rremove("xlab"),
+ncol = 2, nrow = 2,
+font.label = list(size = 20, color = "black", face = "bold", family = NULL, position = "top"),
+          labels = c("A.)", "B.)", "C.)", "D.)"))
+
+```
+
+## 7.4. Checking
+### 7.1. Consumers FG:
+```{r}
+par(mfrow = c(1, 3))
+PlotGLMERFactor(model = BS1_Carnivore_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Carnivore")
+
+PlotGLMERFactor(model = BS1_Herbivore_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Herbivore")
+
+PlotGLMERFactor(model = BS1_Omnivore_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Omnivore")
+
+dplyr::count(B2_R, Land_use_intensity)
+```
+
+### 7.2. Producers FG:
+```{r}
+par(mfrow = c(1, 3))
+PlotGLMERFactor(model = BS2_C_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "C-strategy")
+
+PlotGLMERFactor(model = BS2_S_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "S-strategy")
+
+PlotGLMERFactor(model = BS2_R_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "R-strategy")
+
+```
+
+### 7.3. Decomposers FG:
+```{r}
+par(mfrow = c(1, 2))
+PlotGLMERFactor(model = BS3_Sym_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Symbiotroph")
+
+PlotGLMERFactor(model = BS3_Sapro_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Saprotroph")
+
+# Error
+PlotGLMERFactor(model = BS3_Path_LUI$model,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)),
+                main = "Pathotroph")
+
+
+```
+

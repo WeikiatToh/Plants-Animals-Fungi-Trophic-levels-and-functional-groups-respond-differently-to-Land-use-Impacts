@@ -1,0 +1,1232 @@
+---
+title: "Trophic level modelling"
+author: "JayToh"
+date: '2023-06-01'
+output: html_document
+---
+
+# Library
+
+```{r, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(StatisticalModels)
+library(predictsFunctions)
+library(janitor)
+library(ggpubr)
+library(openxlsx)
+library(tidyr)
+library(DHARMa)
+library(ggpubr)
+library(lme4)
+library(qpcR)
+library(AER)
+library(glmmTMB)
+library(tibble)
+
+select <- dplyr::select
+
+```
+
+# Final Datasets here
+
+Trophic level data:
+
+```{r}
+###### Trophic levels ######
+A1_Consumers_raw <- readRDS("A1.Consumers_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+A2_Producers_raw <- readRDS("A2.Producers_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+A3_Decomposers_raw <- readRDS("A3.Decomposers_clean.rds") %>% rename("Since_last_conversion" = "Since_Last_conversion")
+
+# Checking #
+Ez_LUI_check <- function(df) {
+  A <- df
+  B <- A %>% mutate(Y = 1) %>%  group_by(Land_use, Intensity) %>% summarise(Z = sum(Y)) %>% select(-Z)
+  B}
+
+A1Check <- Ez_LUI_check(A1_Consumers)
+A2Check <- Ez_LUI_check(A2_Producers)
+A3Check <- Ez_LUI_check(A3_Decomposers)
+
+
+```
+
+# Ensure first = last
+
+```{r}
+
+# Checking #
+dplyr::count(A1_Consumers_raw %>% filter(Since_first_conversion == 0), Since_last_conversion) # 18 outliers
+dplyr::count(A1_Consumers_raw %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+
+dplyr::count(A2_Producers_raw %>% filter(Since_first_conversion == 0), Since_last_conversion) # 0
+dplyr::count(A2_Producers_raw %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+
+dplyr::count(A3_Decomposers_raw %>% filter(Since_first_conversion == 0), Since_last_conversion) # 0
+dplyr::count(A3_Decomposers_raw %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+# This happens because the Since_first_conversion detects a drop below 0.7 at the year 2015 (where 2015-2015 =0), while Since_last_conversion above 0.7 at 2014 (2015-2014 = 1). This contradicts the reading, so it is removed!
+
+# Final dataset here!
+A1_Consumers <- A1_Consumers_raw %>% filter(!(Since_first_conversion == 0 & Since_last_conversion == 1))
+A2_Producers <- A2_Producers_raw 
+A3_Decomposers <- A3_Decomposers_raw 
+
+# checking again!
+dplyr::count(A1_Consumers %>% filter(Since_first_conversion == 0), Since_last_conversion) # 0, PERFECT!
+dplyr::count(A1_Consumers %>% filter(Since_last_conversion == 0), Since_first_conversion) # 0
+
+
+## Checking if there is a 0 when the land use is converted
+dplyr::count(A1_Consumers %>% filter(Since_first_conversion == "1165"), Since_last_conversion) # None, perfect!
+dplyr::count(A1_Consumers %>% filter(Since_last_conversion == "1165"), Since_first_conversion) # None, perfect!
+
+dplyr::count(A2_Producers %>% filter(Since_first_conversion == "1165"), Since_last_conversion) # None, perfect!
+dplyr::count(A2_Producers %>% filter(Since_last_conversion == "1165"), Since_first_conversion) # None, perfect!
+
+dplyr::count(A3_Decomposers %>%  filter(Since_first_conversion == "1165"), Since_last_conversion) # None, perfect!
+dplyr::count(A3_Decomposers %>% filter(Since_last_conversion == "1165"), Since_first_conversion) # None, perfect!
+```
+
+# Scaling:
+
+<https://www.r-bloggers.com/2021/12/how-to-use-the-scale-function-in-r/#>:\~:text=Scale()%20is%20a%20built,center%E2%80%9D%20value%20from%20the%20argument.&text=center%3A%20When%20scaling%2C%20whether%20the%20mean%20should%20be%20subtracted. If you center the data while scaling a vector, you will receive negative numbers. When comparing vectors, it reduces the effect of a different scale, bringing it closer to a normal distribution. This type of normalization is useful when comparing proposed data from multiple measures.
+
+1.  Filter out empty rows in Since first and Since last conversion
+2.  Converting to integer (since I am using species richness, this step may not be necessary in this study, but may be useful in the future)
+3.  Merging land use and intensity as "Land_use_intensity"
+4.  Categorizing land use history. This is NOT used in this study but may be useful in future studies!
+
+PLEASE NOTE THAT: "Land_use_intensity" used in the following script is the same as "Land use type and intensity (LUTI)" used in the main study. It was later redefined in the main study to avoid confusion with land intensity (which describes how intensively used a land is!)
+```{r}
+Ezscale <- function(DF) {
+  A <- DF %>% dplyr::filter(!is.na(Since_first_conversion)) %>% filter(!is.na(Since_last_conversion))
+  B <- A %>%  mutate(Years_since_PREDICTS_scaled = scale(Years_since_fragmentation_or_conversion),
+                     Years_since_PREDICTS_log = log(Years_since_fragmentation_or_conversion + 1),
+                     Since_first_conversion_scaled = scale(Since_first_conversion),
+                     Since_first_conversion_log = log(Since_first_conversion + 1),
+                     Since_last_conversion_scaled = scale(Since_last_conversion),
+                     Since_last_conversion_log = log(Since_last_conversion + 1)) %>% 
+    relocate(Years_since_PREDICTS_scaled, Years_since_PREDICTS_log, .after = Years_since_fragmentation_or_conversion) %>% 
+    relocate(Since_first_conversion_scaled, Since_first_conversion_log, .after = Since_first_conversion) %>% 
+    relocate(Since_last_conversion_scaled, Since_last_conversion_log,.after = Since_last_conversion)
+  C <- B %>% mutate(Total_abundance_integer = round(Total_abundance, 0),
+              Simpson_diversity_integer = round(Simpson_diversity, 0),
+              ChaoR_integer = round(ChaoR),
+              Richness_rarefied_integer = round(Richness_rarefied, 0))
+  D <- C %>% mutate(Evenness = ((Simpson_diversity/Species_richness))) 
+
+  ################################################# IGNORE below, not used this study #################################################   
+  E <- D %>% 
+    mutate(Years_since_first = ifelse(Since_first_conversion == 0, "Never", 
+                                               ifelse(Since_first_conversion >0 & Since_first_conversion <= 200, "0~200",
+                                                      ifelse(Since_first_conversion > 200 & Since_first_conversion <= 400, "200~400",
+                                                             ifelse(Since_first_conversion > 400 & Since_first_conversion <= 600, "400~600",
+                                                                    ifelse(Since_first_conversion > 600 & Since_first_conversion <= 800, "600~800",
+                                                                           ifelse(Since_first_conversion > 800 & Since_first_conversion <= 1000, "800~1000",
+                                                                                  ifelse(Since_first_conversion > 1000 & Since_first_conversion < 1165, "1000~1165",
+                                                                                         ifelse(Since_first_conversion == 1165, "Always", "NA"))))))))) %>% 
+    mutate(Years_since_last = ifelse(Since_last_conversion == 0, "Never", 
+                                               ifelse(Since_last_conversion >0 & Since_last_conversion <= 200, "0~200",
+                                                      ifelse(Since_last_conversion > 200 & Since_last_conversion <= 400, "200~400",
+                                                             ifelse(Since_last_conversion > 400 & Since_last_conversion <= 600, "400~600",
+                                                                    ifelse(Since_last_conversion > 600 & Since_last_conversion <= 800, "600~800",
+                                                                           ifelse(Since_last_conversion > 800 & Since_last_conversion <= 1000, "800~1000",
+                                                                                  ifelse(Since_last_conversion > 1000 & Since_last_conversion < 1165, "1000~1165",
+                                                                                         ifelse(Since_last_conversion == 1165, "Always", "NA")))))))))
+  ################################################# IGNORE above, not used this study ################################################# 
+  E <- E %>% relocate(Years_since_first, .after = Since_first_conversion_scaled) %>% relocate(Years_since_last, .after = Since_last_conversion_scaled)
+  E$Intensity_abbreviation <- dplyr::recode(E$Intensity, 
+                                            "Minimal" = "Min",
+                                            "Light" = "Int",
+                                            "Intense" = "Max") 
+  E <- E %>% relocate(Intensity_abbreviation, .after = Intensity)
+  E$Land_use_brief <- dplyr::recode(E$Land_use,
+                                    "PV" = "PV",
+                                    "SV" = "SV",
+                                    "Plantation" = "AG",
+                                    "Pasture" = "AG",
+                                    "Crop" = "AG",
+                                    "Urban" = "Urban")
+  E <- E %>% unite(LUI, c(Land_use_brief, Intensity_abbreviation))
+  E$Land_use_intensity <- dplyr::recode(E$LUI, 
+                                        "PV_Min" = "A_PV",
+                                        "PV_Int" = "A_PV",
+                                        "PV_Max" = "A_PV",
+                                        "SV_Min" = "B_SV",
+                                        "SV_Int" = "B_SV",
+                                        "SV_Max" = "B_SV",
+                                        "AG_Min" = "C1_AG_Min",
+                                        "AG_Int" = "C2_AG_Int",
+                                        "AG_Max" = "C3_AG_Max",
+                                        "Urban_Min" = "D1_Urban_Min",
+                                        "Urban_Int" = "D2_Urban_Int",
+                                        "Urban_Max"= "D3_Urban_Max")
+  E <- droplevels(E)
+}
+
+A1_Consumers <- Ezscale(A1_Consumers) 
+A2_Producers <- Ezscale(A2_Producers)
+A3_Decomposers <- Ezscale(A3_Decomposers)
+
+##### For Saptialauto correlation to work, run these 
+A1_Consumers$SS <- factor(A1_Consumers$SS,levels=unique(A1_Consumers$SS))
+A2_Producers$SS <- factor(A2_Producers$SS,levels=unique(A2_Producers$SS))
+A3_Decomposers$SS <- factor(A3_Decomposers$SS,levels=unique(A3_Decomposers$SS))
+
+#### Tim checking ##### should be TRUE after running the above SpatialAutocorrelation
+all(levels(A1_Consumers$SS)==unique(A1_Consumers$SS)) # TRUE!
+all(levels(A2_Producers$SS)==unique(A2_Producers$SS)) # TRUE!
+all(levels(A3_Decomposers$SS)==unique(A3_Decomposers$SS)) # TRUE!
+
+#### checking ####
+# Yes, scaling is by (value - mean)/SD
+mean(A1_Consumers$Since_last_conversion, na.rm = TRUE) # 276.71
+sd(A1_Consumers$Since_last_conversion, na.rm = TRUE) # 427.67
+dplyr::count(A1_Consumers, Land_use_intensity)
+dplyr::count(A2_Producers, Land_use_intensity)
+dplyr::count(A3_Decomposers, Land_use_intensity)
+
+```
+
+# Function:
+
+```{r}
+######################################################### Function for 1 model #########################################################
+EzmodelSimple <- function(DF, expvar, FE1, RE, max){
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = max)
+  A
+}
+
+############################ AIC weight ###########################
+EzAICweight <- function(modelAIC) {
+  A <- modelAIC
+  
+  B <- data.frame(deltaAIC = akaike.weights(A$Difference)$deltaAIC ,
+                  Relative_likelihood = akaike.weights(A$Difference)$rel.LL,
+                  Weights = akaike.weights(A$Difference)$weights)
+  C <- A %>% cbind(B)
+  C
+}
+
+######################################################### Function for 8 models #########################################################
+Ezmodel <- function(DF, expvar, FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8, RE, max){
+  
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  A0 <- StatisticalModels::GLMEROverdispersion(model = A$model)
+  A1 <- R2GLMER(A$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = A0$P.ChiSq)
+  
+  B <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE2,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  B0 <- StatisticalModels::GLMEROverdispersion(model = B$model)
+  B1 <- R2GLMER(B$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = B0$P.ChiSq)
+  
+  C <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE3,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  C0 <- StatisticalModels::GLMEROverdispersion(model = C$model)
+  C1 <- R2GLMER(C$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = C0$P.ChiSq)
+  
+  D <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE4,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  D0 <- StatisticalModels::GLMEROverdispersion(model = D$model)
+  D1 <- R2GLMER(D$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = D0$P.ChiSq)
+  
+  E <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE5,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  E0 <- StatisticalModels::GLMEROverdispersion(model = E$model)
+  E1 <- R2GLMER(E$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = E0$P.ChiSq)
+  
+  FF <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE6,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                 maxIters = max)
+  F0 <- StatisticalModels::GLMEROverdispersion(model = FF$model)
+  F1 <- R2GLMER(FF$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                         "Overdisp" = F0$P.ChiSq)
+
+  G <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE7,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  G0 <- StatisticalModels::GLMEROverdispersion(model = G$model)
+  G1 <- R2GLMER(G$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = G0$P.ChiSq)
+  
+  H <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE8,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  H0 <- StatisticalModels::GLMEROverdispersion(model = H$model)
+  H1 <- R2GLMER(H$model) %>% as.data.frame() %>% mutate("Marginal_%" = marginal *100,
+                                                        "Overdisp" = H0$P.ChiSq)
+  
+  R2 <- rbind(A1, B1, C1, D1, E1, F1, G1, H1)
+  
+  AIC1 <- AIC(A$model, B$model, C$model, D$model, E$model, FF$model, G$model, H$model)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Fixed_effect = c(FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8)) %>% relocate(Fixed_effect) %>% cbind(R2)  %>% mutate(Explanatory_variable = expvar) %>% mutate(Random_effect = RE) %>% relocate(Random_effect, .after = Fixed_effect)
+  
+  AIC2 <- EzAICweight(AIC2) %>% mutate(Weights_rounded = round(Weights, 10))
+  AIC2
+}
+
+######################################################### NB Function for 8 models #########################################################
+Ezmodel <- function(DF, expvar, FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8, RE, max){
+  
+  A <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE1,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  A1 <- R2GLMER(A$model) %>% as.data.frame() %>% mutate(Fixed = FE1, "Marginal_%" = marginal *100)
+  
+  B <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE2,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  B1 <- R2GLMER(B$model) %>% as.data.frame() %>% mutate(Fixed = FE2, "Marginal_%" = marginal *100)
+  
+  C <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE3,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  C1 <- R2GLMER(C$model) %>% as.data.frame() %>% mutate(Fixed = FE3, "Marginal_%" = marginal *100)
+  
+  D <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE4,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  D1 <- R2GLMER(D$model) %>% as.data.frame() %>% mutate(Fixed = FE4, "Marginal_%" = marginal *100)
+  
+  E <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE5,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  E1 <- R2GLMER(E$model) %>% as.data.frame() %>% mutate(Fixed = FE5, "Marginal_%" = marginal *100)
+  
+  FF <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE6,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                 maxIters = max)
+  F1 <- R2GLMER(FF$model) %>% as.data.frame() %>% mutate(Fixed = FE6, "Marginal_%" = marginal *100)
+
+  G <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE7,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  G1 <- R2GLMER(G$model) %>% as.data.frame() %>% mutate(Fixed = FE7, "Marginal_%" = marginal *100)
+  
+  H <- StatisticalModels::GLMER(modelData = DF,
+                                     responseVar = expvar,
+                                     fitFamily = "poisson",
+                                     fixedStruct = FE8,
+                                     randomStruct = RE,
+                                     saveVars = c("Longitude","Latitude"),
+                                maxIters = max)
+  H1 <- R2GLMER(H$model) %>% as.data.frame() %>% mutate(Fixed = FE8, "Marginal_%" = marginal *100)
+  
+
+  R2 <- rbind(A1, B1, C1, D1, E1, F1, G1, H1)
+  
+  AIC1 <- AIC(A$model, B$model, C$model, D$model, E$model, FF$model, G$model, H$model)
+  AIC2 <- AIC1 %>% mutate(Difference = AIC1$AIC - min(AIC1$AIC)) %>% mutate(Fixed_effect = c(FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8)) %>% relocate(Fixed_effect) %>% cbind(R2) %>% select(-Fixed) %>% mutate(Explanatory_variable = expvar) %>% mutate(Random_effect = RE) %>% relocate(Random_effect, .after = Fixed_effect)
+  AIC2
+}
+
+
+############################ AIC weight ###########################
+EzAICweight <- function(modelAIC) {
+  A <- modelAIC
+  
+  B <- data.frame(deltaAIC = akaike.weights(A$Difference)$deltaAIC ,
+                  Relative_likelihood = akaike.weights(A$Difference)$rel.LL,
+                  Weights = akaike.weights(A$Difference)$weights)
+  C <- A %>% cbind(B)
+  C
+}
+
+############### Spatial autocorrelation ###############
+EzSpatialcheck <- function(md, name) {
+  sat <- StatisticalModels::SpatialAutocorrelationTest(md,ranefGrouping = "SS")
+  hist(sat$P,breaks=c(0,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1),
+       freq=FALSE,
+       main = paste(name))
+abline(v=0.05,lwd=2,col="#ff0000")
+}
+```
+
+# Exploring:
+```{r}
+ggarrange(ggplot(data = A2_Producers, aes(x = Since_first_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) +
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Producers: First", x = "Log Years-since first conversion", y = "Density"),
+          ggplot(data = A1_Consumers, aes(x = Since_first_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) + 
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Consumers: First", x = "Log Years-since first conversion", y = "Density"),
+          ggplot(data = A3_Decomposers, aes(x = Since_first_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) + 
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Decomposers: First", x = "Log Years-since first conversion", y = "Density")
+          ,ggplot(data = A2_Producers, aes(x = Since_last_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) +
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Producers: Last", x = "Log Years-since last conversion", y = "Density"),
+          ggplot(data = A1_Consumers, aes(x = Since_last_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) + 
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Consumers: Last", x = "Log Years-since last conversion", y = "Density"),
+          ggplot(data = A3_Decomposers, aes(x = Since_last_conversion_log)) + 
+            geom_histogram(aes(y = ..density..), bin = 30) + 
+            theme_classic() + 
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  text = element_text(size=16)) +
+            labs(title = "Decomposers: Last", x = "Log Years-since last conversion", y = "Density"), 
+          nrow =2, ncol = 3, labels = c("A.)", "B.)", "C.)", "D.)", "E.)", "F.)"))
+```
+
+
+
+# Candidate Models
+## > Consumers:
+```{r}
+########################################################## Whole conversion ##########################################################
+# Rescale
+A1_AIC_Final <- Ezmodel(A1_Consumers,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+        20000)
+
+A1_AIC_Final_test <- Ezmodel(A1_Consumers,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSB)+(1|SSBS)",
+        20000)
+
+A1_AIC_Final_weighted <- EzAICweight(A1_AIC_Final)
+
+dplyr::count(A1_Consumers, Land_use_intensity)
+```
+
+## > Producers:
+
+```{r}
+A2_AIC_Final <- Ezmodel(A2_Producers,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSBS)",
+        20000)
+
+A2_AIC_Final_weighted <- EzAICweight(A2_AIC_Final)
+
+
+```
+
+## > Decomposers:
+
+```{r}
+A3_AIC_Final <- Ezmodel(A3_Decomposers,                  
+        "Species_richness", 
+        "Land_use_intensity*Since_first_conversion_log", 
+        "Land_use_intensity+Since_first_conversion_log",
+        "Land_use_intensity*Since_last_conversion_log",
+        "Land_use_intensity+Since_last_conversion_log",
+        "Since_first_conversion_log",
+        "Since_last_conversion_log",
+        "Land_use_intensity",
+        "1",
+        "(1|SS)+(1|SSBS)",
+        20000)
+
+A3_AIC_Final_weighted <- EzAICweight(A3_AIC_Final)
+```
+
+# Best YSC + LUI models:
+
+## > Consumers
+
+```{r}
+##### Best: LUI + Last conversion ######
+A1_Consumers <- droplevels(A1_Consumers)
+range(A1_Consumers$Since_last_conversion_log)
+
+# Ok
+AS1_Last_YSC <-  StatisticalModels::GLMER(modelData = A1_Consumers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 40000)
+
+# Rescale warning = best model
+AS1_Last_YSC_biome <-  StatisticalModels::GLMER(modelData = A1_Consumers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB) +(1|SSBS) +(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+AS1_Last_YSC_random_slope <-  StatisticalModels::GLMER(modelData = A1_Consumers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1+Land_use+Intensity|SS) + (1|SSB) + (1|SSBS) + (1|Biome)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+# Comparing #
+AIC(AS1_Last_YSC$model, AS1_Last_YSC_biome$model, AS1_Last_YSC_random_slope$model)
+
+#### Validation ####
+summary(AS1_Last_YSC$model)
+summary(AS1_Last_YSC_biome$model)
+
+plot(simulateResiduals(AS1_Last_YSC$model))
+plot(simulateResiduals(AS1_Last_YSC_biome$model))
+
+StatisticalModels::GLMEROverdispersion(model = AS1_Last_YSC_biome$model)
+EzSpatialcheck(AS1_Last_YSC_biome, "Consumer: YSC")
+
+```
+
+## > Producers
+
+```{r}
+##### Best: LUI + Last conversion ######
+AS2_Last_YSC <- StatisticalModels::GLMER(modelData = A2_Producers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity+Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+summary(AS2_Last_YSC$model)
+
+summary(AS2_Last_YSC$model)
+plot(simulateResiduals(AS2_Last_YSC$model))
+StatisticalModels::GLMEROverdispersion(model = AS1_Last_YSC$model)
+EzSpatialcheck(AS2_Last_YSC, "Producers: YSC")
+```
+
+## > Decomposers
+
+```{r}
+##### Best: LUI + Last conversion ######
+AS3_Last_YSC_r1 <-  EzmodelSimple(A3_Decomposers, 
+                           "Species_richness", 
+                           "Since_last_conversion_log", 
+                           "(1|SS) + (1|SSBS) + (1|Land_use_intensity)", 
+                           20000)
+
+AS3_Last_YSC_LUI <-  EzmodelSimple(A3_Decomposers, 
+                           "Species_richness", 
+                           "Land_use_intensity*Since_last_conversion_log", 
+                           "(1|SS) + (1|SSBS)", 
+                           20000)
+
+AS3_Last_YSC <-  EzmodelSimple(A3_Decomposers, 
+                           "Species_richness", 
+                           "Since_last_conversion_log", 
+                           "(1|SS) + (1|SSBS)", 
+                           20000)
+
+summary(AS3_Last_YSC_LUI$model)
+
+plot(simulateResiduals(AS3_Last_YSC$model))
+plot(simulateResiduals(AS3_Last_YSC_LUI$model))
+plot(simulateResiduals(AS3_Last_YSC_r1$model))
+
+AIC(AS3_Last_YSC_r1$model, AS3_Last_YSC$model) # YSC slightly better
+
+StatisticalModels::GLMEROverdispersion(model = AS3_Last_YSC$model)
+StatisticalModels::GLMEROverdispersion(model = AS3_Last_YSC_LUI$model)
+
+EzSpatialcheck(AS3_Last_YSC_LUI, "Decomposers: YSC LUI")
+```
+
+# Best YSC models:
+
+## > Consumers:
+
+```{r}
+# No rescaling warning
+AS1_Last_YSC_only <-  StatisticalModels::GLMER(modelData = A1_Consumers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 40000)
+
+#### Model validation ####
+summary(AS1_Last_YSC_only$model)
+
+plot(simulateResiduals(AS1_Last_YSC_only$model))
+EzSpatialcheck(AS1_LUI, "Consumer: YSC")
+StatisticalModels::GLMEROverdispersion(model = AS1_Last_YSC_only$model)
+```
+
+## > Producers:
+
+```{r}
+AS2_Last_YSC_only <- StatisticalModels::GLMER(modelData = A2_Producers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Since_last_conversion_log",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+
+summary(AS2_Last_YSC_only$model)
+plot(simulateResiduals(AS2_Last_YSC_only$model))
+StatisticalModels::GLMEROverdispersion(model = AS2_Last_YSC_only$model)
+EzSpatialcheck(AS2_Last_YSC_only, "Producers: YSC")
+```
+
+## > Decomposers:
+
+```{r}
+AS3_Last_YSC <-  EzmodelSimple(A3_Decomposers, 
+                           "Species_richness", 
+                           "Since_last_conversion_log", 
+                           "(1|SS) + (1|SSBS)", 
+                           20000)
+
+#### Model validation ####
+summary(AS3_Last_YSC$model)
+plot(simulateResiduals(AS3_Last_YSC$model))
+EzSpatialcheck(AS3_Last_YSC, "Decomposers: YSC")
+StatisticalModels::GLMEROverdispersion(model = AS3_Last_YSC$model)
+
+```
+
+# Best LU models:
+
+## > Consumers:
+
+```{r}
+####### Best: Land use
+AS1_LUI <- StatisticalModels::GLMER(modelData = A1_Consumers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSB)+(1|SSBS)+(1|Biome)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+#### Model validation ####
+summary(AS1_LUI$model)
+
+plot(simulateResiduals(AS1_LUI$model))
+EzSpatialcheck(AS1_LUI, "Consumer: Land use intensity")
+StatisticalModels::GLMEROverdispersion(model = AS1_LUI$model)
+```
+
+## > Producers:
+
+```{r}
+####### Best: Land use + last conversion
+AS2_LUI <- StatisticalModels::GLMER(modelData = A2_Producers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+#### Model validation ####
+summary(AS2_LUI$model)
+
+plot(simulateResiduals(AS2_LUI$model))
+EzSpatialcheck(AS2_LUI, "Producers: Land use")
+StatisticalModels::GLMEROverdispersion(model = AS2_LUI$model)
+```
+
+## > Decomposers:
+
+```{r}
+####### Best: Land use * last conversio`n
+AS3_LUI <- StatisticalModels::GLMER(modelData = A3_Decomposers,
+                                     responseVar = "Species_richness",
+                                     fitFamily = "poisson",
+                                     fixedStruct = "Land_use_intensity",
+                                     randomStruct = "(1|SS)+(1|SSBS)",
+                                     saveVars = c("Longitude","Latitude"),
+                                     maxIters = 20000)
+
+AS3_LUI_Zero <- glmmTMB::glmmTMB(Species_richness ~ Land_use_intensity + (1|SS)+(1|SSB), 
+                                            data = A3_Decomposers,
+                                            ziformula= ~ Land_use_intensity,
+                                            family = nbinom2)
+
+AS3_LUI_nb <- glmer.nb("Species_richness~Land_use_intensity + (1|SS) + (1|SSB)",
+                                  data = A3_Decomposers,
+                                  nb.control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 80000)))
+
+#### Model validation ####
+summary(AS3_LUI_nb)
+summary(AS3_LUI$model)
+
+plot(simulateResiduals(AS3_LUI$model))
+plot(simulateResiduals(AS3_LUI_Zero))
+plot(simulateResiduals(AS3_LUI_nb))
+
+AIC(AS3_LUI$model, AS3_LUI_nb, AS3_LUI_Zero)
+
+EzSpatialcheck(AS3_LUI, "Decomposers: Land use intensity")
+StatisticalModels::GLMEROverdispersion(model = AS3_LUI_nb)
+
+
+```
+
+# Land use graphs:
+
+```{r}
+
+par(mfrow = c(3,2)) 
+PlotGLMERFactor(model = AS1_Last_YSC$model,data = AS1_Last_YSC$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 30,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(0.5, 3.5, 0.1, 0.1)),
+                main = "Consumers Species richness")
+                
+PlotGLMERFactor(model = AS2_first_scaled$model,data = AS2_first_scaled$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 30,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(0.5, 3.5, 0.1, 0.1)),
+                main = "Producers Species richness")
+
+PlotGLMERFactor(model = AS3_first_scaled$model,data = AS3_first_scaled$data,
+                responseVar = "Species richness",logLink = "e",
+                catEffects = "Land_use",xtext.srt = 30,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(0.5, 3.5, 0.1, 0.1)),
+                main = "Decomposers Species richness")
+
+
+```
+
+## Raw plot:
+
+```{r}
+TestingSV <- A1_Consumers %>% filter(Land_use_intensity == "B_SV") %>% select(Since_last_conversion, Species_richness)
+
+ggplot() + geom_point(data = NULL, aes(x = Since_last_conversion, y = Species_richness)) + xlim(c(1, 1165))
+```
+
+# AIC ALL:
+```{r}
+EzAICSort <- function(AICdf, fg) {
+  A <- AICdf %>% mutate("FG" = fg) %>% select(FG ,Fixed_effect, Random_effect, AIC, Weights) 
+  A
+}
+
+AIC1_Consumers <- EzAICSort(A1_AIC_Final_weighted, "Consumers")
+AIC2_Producers <- EzAICSort(A2_AIC_Final_weighted, "Producers")
+AIC3_Decomposers <- EzAICSort(A3_AIC_Final_weighted, "Decomposers")
+
+AIC_Trophic_levels <- rbind(AIC1_Consumers, AIC2_Producers, AIC3_Decomposers)
+
+saveRDS(AIC_Trophic_levels, "AIC_Trophic_levels.rds")
+```
+
+# YSC + LUI graph:
+## Median, lower, upper function
+Calculate median, upper, and lower for each land use:
+"A_PV", "B_SV", "C1_AG_Min", "C2_AG_Int", "C3_AG_Max", "D1_Urban_Min", "D2_Urban_Int", "D3_Urban_Max"
+```{r, fig.width=10}
+#################################### Upper, median, and lower quantile for each land use intensity ####################################
+range(A1_Consumers$Since_first_conversion_log) # 0.000000 ~ 7.061334 
+
+EzLU <- function(model1, lu){
+  DATA <- model1$data 
+  DATA$Land_use_intensity <- factor(DATA$Land_use_intensity)
+  
+nd <- with(
+  DATA, 
+  data.frame(
+  Since_last_conversion_log = seq(from = 0, to = 7.061334, length.out = 100),
+  Land_use_intensity = factor(x = lu, levels = levels(Land_use_intensity)), 
+  Species_richness=0))
+  
+nd$AgeConv <- exp(nd$Since_last_conversion_log)- 1
+
+preds <- PredictGLMERRandIter(model = model1$model, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower,
+                       "Group" = lu) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+
+preds.df 
+}
+
+```
+
+## Extracting median for each land use intensity
+```{r, fig.width=10}
+#################################### Model data and median ####################################
+# Work out how many land use intensities are there in the model data and forloop through each with the EZLU() function above
+EzMedian <- function(model1) {
+  A <- model1
+  LU_list <-  A$data %>% mutate(Y = 1) %>% group_by(Land_use_intensity) %>% summarise(Z = sum(Y)) %>% 
+    select(Land_use_intensity) %>% unlist() %>% as.character()
+  Temp_list <- list()
+  
+  for(values in 1:length(LU_list)) {
+    Temp_list[[values]] <- EzLU(A , LU_list[values]) # Using the EZLU() function to predict median, upper and lower for each land use
+    names(Temp_list)[[values]] <- noquote((LU_list[values])) # Record the data in a list by their land use intensity
+  }
+
+  
+  B <- do.call(rbind.data.frame, Temp_list)
+  B
+}
+
+# Dataset for plotting #
+AP1_Consumers <- EzMedian(AS1_Last_YSC_biome) # 8 land uses
+AP2_Producers <- EzMedian(AS2_Last_YSC) # 7 land uses, Urban_Max missing
+AP3_Decomposers <- EzMedian(AS3_Last_YSC_LUI) # 8 land uses
+
+TP3_Decomposers <- EzMedian(AS3_Last_YSC_LUI)
+```
+
+## YSC + LUI plot
+### >> Consumers
+```{r, fig.width=10}
+################################################### Consumers YSC + last plot ###################################################
+EzAIC1Plot <- function(model1, df, sz, alp, title1, xlab1, xlim1, x1, y1, rank, r2) {
+  A <- df
+  A$Group <- factor(A$Group, levels = c("None", "A_PV", "B_SV",
+                                      "C1_AG_Min", "C2_AG_Int", "C3_AG_Max",
+                                      "D1_Urban_Min", "D2_Urban_Int", "D3_Urban_Max"))
+  Summary <- summary(model1$model)
+  Estimate <- round((Summary$coefficients[2,1]), 5)
+
+  R2 <- bquote(R^2)
+  
+  Trophic_colors <- c(
+  "None" = "ivory4",
+  "A_PV" = "forestgreen",
+  "B_SV" = "darkolivegreen2",
+  "C1_AG_Min" = "darkblue",
+  "C2_AG_Int" = "cyan3",
+  "C3_AG_Max" = "darkviolet",
+  "D1_Urban_Min" = "sandybrown",
+  "D2_Urban_Int" = "deeppink2",
+  "D3_Urban_Max" = "darkred"
+  )
+  
+  ggplot() + 
+  # PV
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = Group, group = Group), size = sz) +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = Group), alpha = alp) +
+  scale_color_manual(name = "Land use intensity:", values = c(Trophic_colors, "grey95"), label = c("None", "PV", "SV","AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int", "Urban-Max"), drop=FALSE) +
+  scale_fill_manual(values = c(Trophic_colors, "grey95"), guide = "none") + 
+  theme_classic() + 
+  labs(title = title1, subtitle = bquote(.(rank) ~ R^2 ~.(r2)), x = xlab1, y = "Species richness") + xlim(xlim1) +
+  theme(legend.position="right", 
+        text = element_text(size=12),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(colour="black", size=12,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=12, linetype="solid")) + 
+  scale_x_continuous(trans = "log", 
+                     breaks = c(0.1, 1, 10, 50, 200, 1200),
+                     labels = c(0.1, 1, 10, 50, 200, 1200)) +
+  guides(col =guide_legend(nrow=3, ncol = 3))  +
+  annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate))  
+}
+
+EzAIC1PlotProducer <- function(model1, df, sz, alp, title1, xlab1, xlim1, x1, y1, rank, r2) {
+  A <- df
+  A$Group <- factor(A$Group, levels = c("None", "A_PV", "B_SV",
+                                      "C1_AG_Min", "C2_AG_Int", "C3_AG_Max",
+                                      "D1_Urban_Min", "D2_Urban_Int"))
+  Summary <- summary(model1$model)
+  Estimate <- round((Summary$coefficients[2,1]), 5)
+  
+  R2 <- bquote(R^2)
+  
+  Trophic_colors <- c(
+  "None" = "ivory4",
+  "A_PV" = "forestgreen",
+  "B_SV" = "darkolivegreen2",
+  "C1_AG_Min" = "darkblue",
+  "C2_AG_Int" = "cyan3",
+  "C3_AG_Max" = "darkviolet",
+  "D1_Urban_Min" = "sandybrown",
+  "D2_Urban_Int" = "deeppink2"
+  )
+  
+  ggplot() + 
+  # PV
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = Group, group = Group), size = sz) +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = Group), alpha = alp) +
+  scale_color_manual(name = "Land use intensity:", values = c(Trophic_colors, "grey95"), label = c("None", "PV", "SV","AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int"), drop=FALSE) +
+  scale_fill_manual(values = c(Trophic_colors, "grey95"), guide = "none") + 
+  theme_classic() + 
+  labs(title = title1, subtitle = bquote(.(rank) ~ R^2 ~.(r2)), x = xlab1, y = "Species richness") + xlim(xlim1) +
+  theme(legend.position="right", 
+        text = element_text(size=12),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(colour="black", size=12,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=12, linetype="solid")) + 
+  scale_x_continuous(trans = "log", 
+                     breaks = c(0.1, 1, 10, 50, 200, 1200),
+                     labels = c(0.1, 1, 10, 50, 200, 1200)) +
+  guides(col =guide_legend(nrow=3, ncol = 3))  +
+  annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate))  
+}
+
+
+EzAIC1PlotProducer_with_LUI <- function(model1, df, sz, alp, title1, xlab1, xlim1, x1, y1, rank, r2) {
+  A <- df
+  A$Group <- factor(A$Group, levels = c("None", "A_PV", "B_SV",
+                                      "C1_AG_Min", "C2_AG_Int", "C3_AG_Max",
+                                      "D1_Urban_Min", "D2_Urban_Int"))
+  Summary <- summary(model1$model)
+  Estimate <- round((Summary$coefficients[8,1]), 5)
+  
+  R2 <- bquote(R^2)
+  
+  Trophic_colors <- c(
+  "None" = "ivory4",
+  "A_PV" = "forestgreen",
+  "B_SV" = "darkolivegreen2",
+  "C1_AG_Min" = "darkblue",
+  "C2_AG_Int" = "cyan3",
+  "C3_AG_Max" = "darkviolet",
+  "D1_Urban_Min" = "sandybrown",
+  "D2_Urban_Int" = "deeppink2"
+  )
+  
+  ggplot() + 
+  # PV
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = Group, group = Group), size = sz) +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = Group), alpha = alp) +
+  scale_color_manual(name = "Land use intensity:", values = c(Trophic_colors, "grey95"), label = c("None", "PV", "SV","AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int"), drop=FALSE) +
+  scale_fill_manual(values = c(Trophic_colors, "grey95"), guide = "none") + 
+  theme_classic() + 
+  labs(title = title1, subtitle = bquote(.(rank) ~ R^2 ~.(r2)), x = xlab1, y = "Species richness") + xlim(xlim1) +
+  theme(legend.position="right", 
+        text = element_text(size=12),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(colour="black", size=12,  face="bold"),
+        legend.background = element_rect(fill="grey95", size=12, linetype="solid")) + 
+  scale_x_continuous(trans = "log", 
+                     breaks = c(0.1, 1, 10, 50, 200, 1200),
+                     labels = c(0.1, 1, 10, 50, 200, 1200)) +
+  guides(col =guide_legend(nrow=3, ncol = 3))  +
+  annotate(geom = "text",x = x1, y = y1, label = paste("m =", Estimate))  
+}
+
+
+```
+
+### >> Producers
+
+```{r, fig.width=10}
+EzAIC1Plot(AP2_Producers, sz = 2, alp = 0.1, "Producers years since conversion", "Years since last conversions", c(0, 1165))
+```
+
+### >> Decomposers
+```{r}
+EzYSCPlot(AP3_Decomposers_YSC, 0, 1165, 2, "Decomposers" ,"Decomposers species richness over time", "Years since last conversion")
+```
+
+
+
+### >> Overall graph
+
+```{r, fig.width=10}
+ggarrange(EzAIC1Plot(AP1_Consumers, 2, "Consumers years since conversion", "Years since last conversions",c(0, 1165)),
+          EzAIC2Plot(AP2_Producers, 2, "Producers years since conversion", "Years since last conversions", c(0, 1165)),
+          EzYSCPlot(AP3_Decomposers_YSC, 0, 1165, 2, "Decomposers" ,"Decomposers species richness over time", "Years since last conversion"), ncol =3)
+```
+
+## YSC
+
+```{r}
+EzYSC <- function(model1){
+  DATA <- model1$data 
+  
+  nd <- with(
+  DATA, 
+  data.frame(
+  Since_last_conversion_log = seq(from = 0, to = 7.061334, length.out = 100), 
+  Species_richness=0))
+  
+nd$AgeConv <- exp(nd$Since_last_conversion_log)- 1
+
+preds <- PredictGLMERRandIter(model = model1$model, data = nd, nIters = 1000)
+preds <- exp(preds)
+
+preds.median <- apply(X = preds, MARGIN = 1, FUN = median) %>% as.vector()
+preds.upper <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (1/6)) %>% as.vector()
+preds.lower <- apply(X = preds, MARGIN = 1, FUN = quantile, probs = (5/6)) %>% as.vector()
+
+preds.df <- data.frame("Median" = preds.median,
+                       "Upper" = preds.upper,
+                       "Lower" = preds.lower) %>% mutate(Since_conversion = round(nd$AgeConv, 5)) %>% relocate(Since_conversion) 
+preds.df 
+}
+
+
+# Data for plotting
+
+AP3_Decomposers_YSC <- EzYSC(AS3_Last_YSC)
+AP2_Producers_YSC <- EzYSC(AS2_Last_YSC_only)
+
+```
+
+### >> Decomposers
+```{r}
+EzYSCPlot <- function(df1, x1, x2, sz, FG ,title1, xlab1) {
+  A <- df1 %>% filter(Since_conversion >= x1 & Since_conversion <= x2)
+  FG_color <- c("Producers" = "darkgreen",
+                "Decomposers" = "deepskyblue",
+                "Consumers" = "darkred")
+  
+  ggplot() + 
+  geom_line(data = A, aes(x = Since_conversion, y = Median, col = FG), size = sz) +  geom_ribbon(data = A, aes(ymin = Lower, ymax = Upper, x = Since_conversion, fill = FG), alpha = 0.2) + 
+  theme_classic() + 
+  labs(title = title1, x = xlab1, y = "Species richness")  +
+    scale_color_manual(name = "Functional groups", values = FG_color, position = "bottom") + 
+    scale_fill_manual(values = FG_color, guide = "none") + scale_x_continuous(trans = "log", 
+                                                              breaks = c(0.1, 1, 10, 50, 200, 1200),
+                                                              labels = c(0.1, 1, 10, 50, 200, 1200)) +
+    theme(legend.position="bottom")
+}
+
+EzYSCPlot(AP3_Decomposers_YSC, 0, 1165, 2, "Decomposers" ,"Decomposers species richness over time", "Years since last conversion")
+
+```
+
+# LUI plot:
+## Ezland
+Extract the fixed effect estimates and standard eror and back-transform the values in a dataframe. 
+```{r}
+Ezland <- function(model1, TLFG){
+######################### Intercept #########################  
+A <- fixef(model1$model)  %>% as.data.frame() %>% rename("Difference" = ".") %>% rownames_to_column("Variables") 
+
+Intercept <- A %>% filter(Variables == "(Intercept)") %>% select(Difference) %>% as.vector()
+Intercept_value <- Intercept$Difference
+
+B <- A %>% filter(!(Variables == "(Intercept)")) %>% mutate("Intercept_per_land" = Difference + Intercept_value) %>% select(-Difference)
+B$Variables <- gsub("Land_use_intensity", "", B$Variables)
+
+B1 <- data.frame(Variables = "A_PV", "Intercept_per_land" = Intercept_value)
+
+C <- rbind(B1, B)
+
+
+######################### Standard error #########################  
+D <- se.fixef(model1$model)  %>% as.data.frame() %>% rename("SE_per_land" = ".") %>% rownames_to_column("Variables_SE") 
+
+D$Variables_SE <- gsub("Land_use_intensity", "", D$Variables_SE)  
+D$Variables_SE <- dplyr::recode(D$Variables_SE, "(Intercept)" = "A_PV")
+
+
+######################### Combining intercept and SE #########################
+Final <- cbind(C, D) %>% select(-Variables_SE)
+Final2 <- Final %>% mutate(CI_new = SE_per_land*1.96,
+                           Upper_before = Intercept_per_land + CI_new,
+                           Lower_before = Intercept_per_land - CI_new,
+                           Intercept_reverse = exp(Intercept_per_land),
+                           Upper_reverse = exp(Upper_before),
+                           Lower_reverse = exp(Lower_before))
+
+Final3 <- Final2 %>% mutate(Intecept_Per = ((Intercept_reverse/Final2[1,7])*100)-100, # (Back-transformed value/Back-transformed intercept)*100 - 100
+                            Upper_Per = ((Upper_reverse)/Final2[1,7]*100)-100,
+                            Lower_Per = ((Lower_reverse)/Final2[1,7]*100)-100)
+
+Final3[1,11] <- 0 # Change only the Upper_reverse of PV to 0 (because we are comparing this with other, so its SE is not really important)
+Final3[1,12] <- 0 # Change only the Lower_reverse of PV to 0
+
+######################### Sample size #########################
+SampleSize <- dplyr::count(model1$data, Land_use_intensity) 
+
+Final4 <- cbind(Final3, SampleSize)
+
+Final5 <- Final4 %>% mutate(Group = TLFG) %>% relocate(Group)
+
+}
+
+
+############ FINAL DATASET HERE FOR PLOTTING ############
+AP1_Consumers_LUI <- Ezland(AS1_LUI, "Consumers")
+AP2_Producers_LUI <- Ezland(AS2_LUI, "Producers")
+AP3_Decomposers_LUI <- Ezland(AS3_LUI, "Decomposers")
+
+```
+
+## Ezlandplot
+```{r, fig.width=10}
+Ezlandplot <- function(df1, df2, df3, DW, EW, sz, sze, sz_sample, sztext, y1, title1) {
+  A <- rbind(df1, df2, df3)
+  A$Group <- factor(A$Group, levels = c("Producers", "Consumers", "Decomposers"))
+  TLFG_color <- c("Producers" = "olivedrab1",
+                  "Consumers" = "red",
+                  "Decomposers" = "saddlebrown")
+  
+  ggplot() + 
+    geom_hline(yintercept = 0, col = "grey") +
+    geom_errorbar(data = A, aes(x = Variables, ymin = Lower_Per, ymax = Upper_Per, group = Group), 
+                  position = position_dodge(width = DW), 
+                  width = EW, 
+                  size = sze) +
+    geom_point(data = A, aes(x = Variables, y = Intecept_Per, group = Group, fill = Group), 
+               position = position_dodge(width = DW), 
+               size = sz,
+               shape =21,
+               col = "black",
+               stroke = 1.5)  +
+    geom_text(data = A ,aes(x = Variables, y = y1, group = Group,label = n), position = position_dodge(DW), size = sz_sample, angle = 45, color = "grey") +
+  theme_classic() + 
+  scale_x_discrete(expand=c(0.08, 0.08), label = c("PV", "SV", "AG-Min", "AG-Int", "AG-Max", "Urban-Min", "Urban-Int", "Urban-Max")) +
+  scale_fill_manual(name = "Trophic levels",values = TLFG_color, position = "bottom") +
+    theme(legend.position="bottom") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x=element_text(angle=30, hjust=1),
+        axis.title.x = element_text(vjust = -0.75)) + 
+  theme(text = element_text(size = sztext)) +
+  theme(legend.title=element_blank()) +  
+  labs(y = "Species richness difference (%)", x = "Land use", title = title1)
+}
+
+# testing
+Ezlandplot(AP1_Consumers_LUI, AP2_Producers_LUI, AP3_Decomposers_LUI, DW = 0.8, EW = 0.5, sz = 5, sze = 0.8, sz_sample = 3, sztext = 18, y1 = 10, title1 = "All trophic levels")
+```
+
+
+
+
+## Separate LUI
+```{r}
+PlotGLMERFactor(model = AS1_LUI$model,data = AS1_LUI$data,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)))
+
+PlotGLMERFactor(model = AS2_LUI$model,data = AS2_LUI$data,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)))
+
+PlotGLMERFactor(model = AS3_LUI$model,data = AS3_LUI$data,
+                responseVar = "Species_richness",logLink = "e",
+                catEffects = "Land_use_intensity",xtext.srt = 45,
+                order = c(1,2,3,4,5,6,7,8),
+                params = list(mar = c(1.2, 3.5, 0.2, 0.2)))
+```
+
