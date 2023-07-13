@@ -1,0 +1,185 @@
+---
+title: "Locations and LUH"
+author: "JayToh"
+date: '2023-05-21'
+output: html_document
+---
+
+# Library:
+```{r}
+library(dplyr)
+```
+
+# Data:
+Dataset from 2.Grouping. 
+```{r}
+
+Animals <- read.csv("1.AnimalFG.csv") %>% select(-X.1, -X) %>% relocate(Longitude, Latitude)
+Plants <- read.csv("2.PlantFG.csv") %>% select(-X.1, -X) %>% relocate(Longitude, Latitude)
+Fungi <- read.csv("3.FungiFG.csv") %>% select(-X.1, -X) %>% relocate(Longitude, Latitude)
+
+### Location from LUH ###
+Lonlat <- read.csv("Lonlat_df.csv") %>% select(-X)
+```
+
+# Simplify:
+```{r}
+############# Function that simplify names #############
+Ezsimplify <- function(df) {
+  A <- df %>% mutate(Land_use = Predominant_land_use) %>% relocate(Land_use, .after = Predominant_land_use) %>% relocate(Use_intensity, .after = Land_use) %>% mutate(Intensity = Use_intensity) %>% relocate(Intensity, .after = Use_intensity)
+  A$Land_use <- dplyr::recode(A$Predominant_land_use,
+                                                       "Primary vegetation" = "PV",
+                                                       "Young secondary vegetation" = "SV",
+                                                       "Intermediate secondary vegetation" = "SV",
+                                                       "Mature secondary vegetation" = "SV",
+                                                       "Secondary vegetation (indeterminate age)" = "SV",
+                                                       "Plantation forest" = "Plantation",
+                                                       "Cropland" = "Crop")
+  A$Intensity <- dplyr::recode(A$Use_intensity,
+                                                       "Minimal use" = "Minimal",
+                                                       "Light use" = "Light",
+                                                       "Intense use" = "Intense")
+  A$SSS <- factor(A$SSS)
+  A$Source_ID <- factor(A$Source_ID)
+  A$SS <- factor(A$SS)
+  A
+}
+
+############# Simplified Dataframe here #############
+count(AnimalFG, LandUse) # Human-dominated, PV, SV
+
+Animals_simplified <- Ezsimplify(Animals)
+Plants_simplified <- Ezsimplify(Plants)  
+Fungi_simplified <- Ezsimplify(Fungi) 
+
+#### Checking ####
+dplyr::count(Animals, Land_use)
+```
+
+# Converting locations
+## Lon, Lat, Land use
+Preparing for matching into gridded cells
+1. Column for general land use (Natural vs Artificial)
+2. Remove locations with NAs
+```{r}
+EzNoNa <- function(DF){
+  A <- DF
+  B <- A %>% mutate(General_land_use = ifelse(Land_use == "PV" |Land_use == "SV", "Natural", "Artificial")) %>% relocate(General_land_use, .after = Land_use)
+  C <- B[complete.cases(B[, 1:2]),] # Column 1 and 2 are Lon and Lat respectfully
+  C
+}
+
+EzNoNa2 <- function(DF){
+  A <- DF
+  C <- A[complete.cases(A[, 11:12]),] # Column 11 and 12 are Lon and Lat respectfully
+  C
+}
+
+Animals_lonlat <- EzNoNa(Animals_simplified) # Removed 1,232 records
+Plants_lonlat <- EzNoNa(Plants_simplified)
+Fungi_lonlat <- EzNoNa(Fungi_simplified)
+
+rm(Animals_simplified, Plants_simplified, Fungi_simplified)
+```
+
+## LUH gridded locations 
+```{r}
+lon_df <- Lonlat %>% select(Lon, Lon_max, Lon_min) %>% mutate(X = 1) %>% group_by(Lon, Lon_max, Lon_min) %>% summarise(Y = sum(X)) %>% select(-Y) # should have 1440. YES!
+lat_df <- Lonlat %>% select(Lat, Lat_max, Lat_min) %>% mutate(X = 1) %>% group_by(Lat, Lat_max, Lat_min) %>% summarise(Y = sum(X)) %>% select(-Y) # should have 720. YES!
+```
+
+## Gridding 
+1. Convert exact locations from PREDICTS to gridded locations used in LUH (Watch out for # of rows, data can duplicate with left_join)
+```{r}
+########### Function for matching PREDICTS location to gridded cells ###########
+Ezforlocation <- function(DF) {
+  #### Longitude ####
+  A <- DF$Longitude
+  B <- numeric() # For storing data later from each iteration
+  for(values in 1:length(A)) {
+  B[values]  <- ifelse(A[values] < lon_df$Lon_max & A[values] >= lon_df$Lon_min, lon_df$Lon, NA) %>% na.omit() %>% as.numeric()
+  }
+  
+  C <- B %>% data.frame(Lon = A, Lon_grid = B)
+  C <- C[,2:3] # The first column is repeated, so no need to keep it. Only the second and third column have the original longitude and grid longitude respectfully
+  
+  #### Latitude ####
+  D <- DF$Latitude
+  E <- numeric() # For storing data later from each iteration
+  for(values in 1:length(D)) {
+  E[values]  <- ifelse(D[values] < lat_df$Lat_max & D[values] >= lat_df$Lat_min, lat_df$Lat, NA) %>% na.omit() %>% as.numeric()
+  }
+  
+  FF <- E %>% data.frame(Lat = D, Lat_grid = E)
+  FF <- FF[,2:3]
+  G <- cbind(C, FF) %>% relocate(Lat, .after = Lon) # Combine longitude and latitude together into one data frame
+  
+  Final_DF <- cbind(DF, G) %>% 
+    relocate(Lon, .after=  Longitude) %>% 
+    relocate(Lat, .after = Latitude) %>% 
+    relocate(Lon_grid, .after = Lon) %>% 
+    relocate(Lat_grid, .after = Lat)
+  Final_DF
+}
+
+####### Converted dataset here! #######
+# Can take a few minutes to run, be patient!
+Animals_Final <- Ezforlocation(Animals_lonlat)
+Plants_Final <- Ezforlocation(Plants_lonlat)
+Fungi_Final <- Ezforlocation(Fungi_lonlat)
+
+
+```
+
+# Years_since
+```{r}
+Natural_conversion <- readRDS("Natural_conversion.rds") %>% select(Lon, Lat, Last_conversion_forward, Since_conversion_forward, Last_conversion_backward, Since_conversion_backward) %>% rename("First_conversion" = "Last_conversion_forward",                                                                                                        "Since_first_conversion" = "Since_conversion_forward", 
+                                                                "Last_conversion" = "Last_conversion_backward", 
+                                                                "Since_Last_conversion" = "Since_conversion_backward") %>% 
+  rename("Lon_grid" = "Lon", "Lat_grid" = "Lat")
+
+
+### Testing ###
+Testing <- readRDS("Natural_conversion.rds")
+Testing1 <- rbind(Testing %>% filter(Lon == 46.375, Lat == -24.875),
+                  Testing %>% filter(Lon == 21.625, Lat == 50.375),
+                  Testing %>% filter(Lon == -32.875, Lat == 83.125),
+                  Testing %>% filter(Lon == -77.125, Lat == 43.875))
+
+rm(Testing, Testing1)
+```
+
+## Animals match:
+```{r}
+Animals_converted <- dplyr::left_join(Animals_Final, Natural_conversion, by = c("Lon_grid", "Lat_grid")) %>% relocate(First_conversion, Since_first_conversion, Last_conversion, Since_Last_conversion, .after = Years_since_fragmentation_or_conversion)
+
+
+dplyr::count(Animals_converted %>% mutate(Is_same = (Years_since_fragmentation_or_conversion == Since_Last_conversion)), Is_same)
+
+
+```
+
+## Plants match:
+```{r}
+Plants_converted <- dplyr::left_join(Plants_Final, Natural_conversion, by = c("Lon_grid", "Lat_grid")) %>% relocate(First_conversion, Since_first_conversion, Last_conversion, Since_Last_conversion, .after = Years_since_fragmentation_or_conversion)
+
+dplyr::count(Plants_converted %>% mutate(Is_same = (Years_since_fragmentation_or_conversion == Since_Last_conversion)), Is_same)
+```
+
+## Fungi match:
+```{r}
+Fungi_converted <- dplyr::left_join(Fungi_Final, Natural_conversion, by = c("Lon_grid", "Lat_grid")) %>% relocate(First_conversion, Since_first_conversion, Last_conversion, Since_Last_conversion, .after = Years_since_fragmentation_or_conversion)
+
+dplyr::count(Fungi_converted %>% mutate(Is_same = (Years_since_fragmentation_or_conversion == Since_Last_conversion)), Is_same)
+```
+
+# Export data:
+Export data for diversity calculation
+```{r}
+saveRDS(Animals_converted, "Animals_converted.rds")
+saveRDS(Plants_converted, "Plants_converted.rds")
+saveRDS(Fungi_converted, "Fungi_converted.rds")
+```
+
+
+
